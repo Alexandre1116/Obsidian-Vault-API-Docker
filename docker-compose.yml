@@ -7,9 +7,14 @@ services:
       - "2768:2768"
     volumes:
       - /path/to/your/vault:/vault
+      - vault-api-data:/data
     environment:
       - VAULT_PATH=/vault
+      - DATA_DIR=/data
       - VAULT_API_PORT=2768
       - VAULT_API_BIND=0.0.0.0
       - VAULT_API_KEY=
       - VAULT_API_ALLOWED_COMMANDS=*
+
+volumes:
+  vault-api-data:

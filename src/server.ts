@@ -7,6 +7,8 @@ import * as nodePath from "node:path";
 import * as fs from "node:fs";
 import { exec } from "node:child_process";
 import { VaultTools } from "./vault-tools.js";
+import { getDashboardHtml } from "./web-ui.js";
+import type { Config } from "./config.js";
 
 const SSE_KEEPALIVE_MS = 15_000;
 
@@ -66,27 +68,42 @@ function validateStr(val: unknown, name: string, maxLen: number): string {
   return val;
 }
 
+export interface ServerCallbacks {
+  getConfig: () => Config;
+  updateConfig: (partial: Partial<Config>) => Config;
+  regenerateApiKey: () => string;
+  restartMcp: () => Promise<boolean>;
+  stopMcp: () => Promise<boolean>;
+  isMcpRunning: () => boolean;
+  getMcpPort: () => number;
+}
+
 export class VaultMcpServer {
   private httpServer: http.Server | null = null;
   private transports = new Map<string, SSEServerTransport>();
   private sockets = new Set<Socket>();
   private tools: VaultTools;
   private vaultName: string;
+  private mcpServer: Server | null = null;
+  private isRunning = false;
 
   constructor(
     private vaultBase: string,
-    private port: number,
-    private apiKey: string,
-    private allowedCommands: string = "*",
-    private bindAddress: string = "0.0.0.0"
+    private config: Config,
+    private callbacks: ServerCallbacks
   ) {
     this.tools = new VaultTools(vaultBase);
     this.vaultName = nodePath.basename(vaultBase);
   }
 
+  private get port(): number { return this.config.port; }
+  private get apiKey(): string { return this.config.apiKey; }
+  private get allowedCommands(): string { return this.config.allowedCommands; }
+  private get bindAddress(): string { return this.config.bindAddress; }
+
   private createMcpInstance(): Server {
     const mcp = new Server(
-      { name: "obsidian-vault-api-docker", version: "1.0.0" },
+      { name: "obsidian-vault-api-docker", version: "1.1.0" },
       { capabilities: { tools: {} } }
     );
     this.registerTools(mcp);
@@ -435,7 +452,31 @@ export class VaultMcpServer {
     });
   }
 
-  start(): Promise<void> {
+  // ── MCP server lifecycle ─────────────────────────────────────────────
+
+  async startMcp(): Promise<void> {
+    if (this.isRunning) return;
+    const mcp = this.createMcpInstance();
+    this.mcpServer = mcp;
+    this.isRunning = true;
+    console.log(`[vault-api] MCP server started on ${this.bindAddress}:${this.port}`);
+  }
+
+  async stopMcp(): Promise<void> {
+    this.isRunning = false;
+    this.transports.clear();
+    for (const socket of this.sockets) {
+      if (!socket.destroyed) socket.destroy();
+    }
+    this.sockets.clear();
+    console.log("[vault-api] MCP server stopped");
+  }
+
+  get running(): boolean { return this.isRunning; }
+
+  // ── HTTP server (web UI + MCP SSE) ────────────────────────────────────
+
+  startHttp(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.httpServer = http.createServer((req, res) => {
         this.handleRequest(req, res).catch(err => {
@@ -458,14 +499,13 @@ export class VaultMcpServer {
     });
   }
 
-  stop(): Promise<void> {
+  stopHttp(): Promise<void> {
     return new Promise(resolve => {
       if (!this.httpServer) return resolve();
-      this.transports.clear();
       const server = this.httpServer;
       this.httpServer = null;
       const timeout = setTimeout(() => {
-        console.warn("[vault-api] server close timed out, forcing shutdown");
+        console.warn("[vault-api] HTTP close timed out, forcing shutdown");
         resolve();
       }, 5000);
       server.close(() => { clearTimeout(timeout); resolve(); });
@@ -473,6 +513,8 @@ export class VaultMcpServer {
       this.sockets.clear();
     });
   }
+
+  // ── Auth ─────────────────────────────────────────────────────────────
 
   private authed(req: http.IncomingMessage): boolean {
     if (!this.apiKey) return true;
@@ -482,17 +524,104 @@ export class VaultMcpServer {
     return url.searchParams.get("key") === this.apiKey;
   }
 
+  // ── Request handler ──────────────────────────────────────────────────
+
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+    const url = new URL(req.url ?? "/", `http://${this.bindAddress}:${this.port}`);
+
+    // CORS for all routes
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key");
 
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-    const url = new URL(req.url ?? "/", `http://${this.bindAddress}:${this.port}`);
+    // ── Web UI dashboard (no auth — it's the config page) ──────────────
+    if (url.pathname === "/" || url.pathname === "/ui" || url.pathname === "/dashboard") {
+      const cfg = this.callbacks.getConfig();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(getDashboardHtml(cfg.port, cfg.apiKey));
+      return;
+    }
+
+    // ── Web API endpoints (no auth — local config only) ─────────────────
+    if (url.pathname === "/api/status" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        running: this.callbacks.isMcpRunning(),
+        port: this.callbacks.getMcpPort(),
+        vault: this.vaultName,
+      }));
+      return;
+    }
+
+    if (url.pathname === "/api/config" && req.method === "GET") {
+      const cfg = this.callbacks.getConfig();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(cfg));
+      return;
+    }
+
+    if (url.pathname === "/api/config" && req.method === "PUT") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          const partial = JSON.parse(body);
+          if (partial.port !== undefined) {
+            const n = Number(partial.port);
+            if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error("Invalid port");
+          }
+          if (partial.bindAddress !== undefined && typeof partial.bindAddress !== "string") throw new Error("Invalid bindAddress");
+          if (partial.allowedCommands !== undefined && typeof partial.allowedCommands !== "string") throw new Error("Invalid allowedCommands");
+
+          const updated = this.callbacks.updateConfig(partial);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, config: updated }));
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+        }
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/key/regenerate" && req.method === "POST") {
+      const newKey = this.callbacks.regenerateApiKey();
+      this.config = this.callbacks.getConfig();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, apiKey: newKey }));
+      return;
+    }
+
+    if (url.pathname === "/api/server/restart" && req.method === "POST") {
+      try {
+        await this.callbacks.restartMcp();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      }
+      return;
+    }
+
+    if (url.pathname === "/api/server/stop" && req.method === "POST") {
+      try {
+        await this.callbacks.stopMcp();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      }
+      return;
+    }
+
+    // ── MCP endpoints (require auth) ───────────────────────────────────
 
     if (url.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      const body: Record<string, unknown> = { status: "ok", version: "1.0.0" };
+      const body: Record<string, unknown> = { status: "ok", version: "1.1.0" };
       if (this.authed(req)) {
         body.vault = this.vaultName;
         body.port = this.port;
@@ -535,6 +664,12 @@ export class VaultMcpServer {
     }
 
     if (url.pathname === "/sse" && req.method === "GET") {
+      if (!this.isRunning) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP server is not running. Start it from the web UI." }));
+        return;
+      }
+
       const transport = new SSEServerTransport("/message", res);
       this.transports.set(transport.sessionId, transport);
 

@@ -1,8 +1,8 @@
 # Obsidian Vault API — Docker
 
-Docker-compatible version of [Obsidian Vault API](https://github.com/Alexandre1116/Obsidian-vault-api). Exposes your Obsidian vault as an MCP server — no Obsidian desktop app required.
+Docker-compatible version of [Obsidian Vault API](https://github.com/Alexandre1116/Obsidian-vault-api). Exposes your Obsidian vault as an MCP server — no Obsidian desktop app required. Runs 24/7 on any server or NAS.
 
-The original plugin runs **inside Obsidian** and uses the Obsidian API + Electron's Canvas for image processing. This version runs as a **standalone Node.js process in Docker**, using direct `fs` operations and [`sharp`](https://sharp.pixelplumbing.com/) for image resizing. All MCP tools from the original are preserved.
+The original plugin runs **inside Obsidian** and uses the Obsidian API + Electron's Canvas for image processing. This version runs as a **standalone Node.js process in Docker**, using direct `fs` operations and [`sharp`](https://sharp.pixelplumbing.com/) for image resizing. All 13 MCP tools from the original are preserved.
 
 ## Quick Start
 
@@ -18,8 +18,12 @@ services:
       - "2768:2768"
     volumes:
       - /path/to/your/vault:/vault
+      - vault-api-data:/data
     environment:
       - VAULT_API_KEY=your-secret-key-here
+
+volumes:
+  vault-api-data:
 ```
 
 ```bash
@@ -33,24 +37,51 @@ docker run -d \
   --name obsidian-vault-api \
   -p 2768:2768 \
   -v /path/to/your/vault:/vault \
+  -v vault-api-data:/data \
   -e VAULT_API_KEY=your-secret-key-here \
   ghcr.io/alexandre1116/obsidian-vault-api-docker:latest
 ```
 
+## Web UI
+
+After starting the container, open your browser and go to:
+
+```
+http://localhost:2768/
+```
+
+The dashboard lets you:
+- **View server status** (running/stopped, port, vault name)
+- **Edit configuration** (port, bind address, allowed commands) — changes are saved to `/data/config.json` and persist across restarts
+- **Regenerate API key** — generates a new secret, requires reconnecting clients
+- **Restart / Stop** the MCP server without stopping the container
+- **Copy connection info** — SSE URL, Claude Desktop JSON config, API key
+
+The web UI itself does not require authentication (it's the config page). The MCP endpoints (`/sse`, `/message`, `/raw`) require the API key.
+
 ## Configuration
 
-All configuration is via environment variables:
+Configuration is stored in `/data/config.json` and persists across container restarts. Environment variables act as **initial overrides** on first boot — after that, the config file is the source of truth.
 
 | Variable | Default | Description |
 |---|---|---|
 | `VAULT_PATH` | `/vault` | Path to the vault directory inside the container |
+| `DATA_DIR` | `/data` | Path for persistent config file |
 | `VAULT_API_PORT` | `2768` | Port to listen on |
-| `VAULT_API_BIND` | `0.0.0.0` | Bind address (use `0.0.0.0` for Docker) |
-| `VAULT_API_KEY` | *(auto-generated)* | API key for authentication. If empty, one is generated on startup |
+| `VAULT_API_BIND` | `0.0.0.0` | Bind address (`0.0.0.0` for Docker / network access) |
+| `VAULT_API_KEY` | *(auto-generated)* | API key for MCP authentication. If empty, one is generated and saved |
 | `VAULT_API_ALLOWED_COMMANDS` | `*` | Glob patterns for allowed shell commands (comma-separated). `*` = all |
 | `VAULT_API_HOST` | `127.0.0.1:2768` | Host reported in image URLs (set to your external address if behind a proxy) |
 
 ## Connecting Your AI Client
+
+### LM Studio / Open WebUI / Any MCP client with SSE support
+
+Add MCP server URL:
+
+```
+http://localhost:2768/sse?key=YOUR_API_KEY
+```
 
 ### Claude Desktop
 
@@ -66,15 +97,7 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-> Note: Claude Desktop's MCP support uses stdio. For SSE-based servers, use the `bridge.js` approach from the original plugin, or use an MCP client that supports SSE natively (LM Studio, Open WebUI, etc.).
-
-### LM Studio / Open WebUI / Any MCP client with SSE support
-
-Add MCP server URL:
-
-```
-http://localhost:2768/sse?key=YOUR_API_KEY
-```
+Or copy the JSON directly from the Web UI dashboard.
 
 ### Authentication
 
@@ -111,11 +134,36 @@ Large images are auto-resized using `sharp` (pure Node.js, no Electron):
 | 20–100 MB | 800 px | JPEG 85% |
 | > 100 MB | 512 px | JPEG 85% |
 
+## NFS / Network Mounts
+
+The server reads files fresh from the filesystem on every tool call — no caching. NFS mounts work in real-time:
+
+```yaml
+volumes:
+  - nfs-vault:/vault
+
+volumes:
+  nfs-vault:
+    driver: local
+    driver_opts:
+      type: nfs
+      device: ":/path/on/nfs"
+      o: addr=10.0.0.1,nfsvers=4
+```
+
+## Health Check
+
+```bash
+curl http://localhost:2768/health
+```
+
+Returns `{ "status": "ok", "version": "1.1.0" }` publicly. Authenticated requests also return `vault`, `port`, and `sessions`.
+
 ## Building from Source
 
 ```bash
-git clone https://github.com/Alexandre1116/obsidian-vault-api-docker
-cd obsidian-vault-api-docker
+git clone https://github.com/Alexandre1116/Obsidian-Vault-API-Docker
+cd Obsidian-Vault-API-Docker
 docker compose build
 docker compose up -d
 ```
@@ -128,15 +176,7 @@ npm run build
 VAULT_PATH=/path/to/vault VAULT_API_KEY=secret npm start
 ```
 
-## Health Check
-
-```bash
-curl http://localhost:2768/health
-```
-
-Returns `{ "status": "ok", "version": "1.0.0" }` publicly. Authenticated requests also return `vault`, `port`, and `sessions`.
-
-## Differences from the Original
+## Differences from the Original Plugin
 
 | | Original (Obsidian plugin) | Docker version |
 |---|---|---|
@@ -144,9 +184,10 @@ Returns `{ "status": "ok", "version": "1.0.0" }` publicly. Authenticated request
 | **File access** | Obsidian Vault API (`app.vault`) | Node.js `fs` |
 | **Image resize** | Electron Canvas API | `sharp` (native, no GUI dependency) |
 | **File deletion** | System trash (recoverable) | Permanent delete |
-| **Bridge.js / Claude config** | Auto-written by plugin | Manual config (see above) |
-| **Settings UI** | Obsidian settings tab | Environment variables |
+| **Settings UI** | Obsidian settings tab | Web UI at `http://host:2768/` |
+| **Config storage** | Obsidian plugin data | `/data/config.json` (Docker volume) |
 | **Bind address** | `127.0.0.1` only | Configurable (`0.0.0.0` by default) |
+| **Bridge.js / Claude config** | Auto-written by plugin | Copy from Web UI |
 
 ## License
 

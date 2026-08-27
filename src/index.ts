@@ -1,11 +1,8 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { VaultMcpServer } from "./server.js";
-
-function generateKey(): string {
-  return crypto.randomBytes(24).toString("hex");
-}
+import { VaultMcpServer, type ServerCallbacks } from "./server.js";
+import { ConfigManager } from "./config.js";
+import type { Config } from "./config.js";
 
 function getEnv(name: string, fallback?: string): string {
   const val = process.env[name];
@@ -24,24 +21,13 @@ function getEnvNumber(name: string, fallback: number): number {
   return fallback;
 }
 
-function getEnvBool(name: string, fallback: boolean): boolean {
-  const val = process.env[name];
-  if (val === undefined) return fallback;
-  return val === "true" || val === "1" || val === "yes";
-}
-
 async function main() {
   const vaultPath = getEnv("VAULT_PATH", "/vault");
-  const port = getEnvNumber("VAULT_API_PORT", 2768);
-  const bindAddress = getEnv("VAULT_API_BIND", "0.0.0.0");
-  const allowedCommands = getEnv("VAULT_API_ALLOWED_COMMANDS", "*");
-
-  let apiKey = getEnv("VAULT_API_KEY");
-  if (!apiKey) {
-    apiKey = generateKey();
-    console.log(`[vault-api] No VAULT_API_KEY set — generated: ${apiKey}`);
-    console.log("[vault-api] Set VAULT_API_KEY env var to use a fixed key.");
-  }
+  const dataDir = getEnv("DATA_DIR", "/data");
+  const envPort = getEnvNumber("VAULT_API_PORT", 0);
+  const envBind = getEnv("VAULT_API_BIND", "");
+  const envKey = getEnv("VAULT_API_KEY");
+  const envAllowed = getEnv("VAULT_API_ALLOWED_COMMANDS", "");
 
   if (!fs.existsSync(vaultPath)) {
     console.error(`[vault-api] ERROR: Vault path '${vaultPath}' does not exist.`);
@@ -55,25 +41,71 @@ async function main() {
     process.exit(1);
   }
 
-  const resolvedVault = path.resolve(vaultPath);
-  console.log(`[vault-api] Vault:   ${resolvedVault}`);
-  console.log(`[vault-api] Port:    ${port}`);
-  console.log(`[vault-api] Bind:    ${bindAddress}`);
-  console.log(`[vault-api] API Key: ${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 4)}`);
-  console.log(`[vault-api] Allowed:  ${allowedCommands}`);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
 
-  const server = new VaultMcpServer(
-    resolvedVault,
-    port,
-    apiKey,
-    allowedCommands,
-    bindAddress
-  );
+  const resolvedVault = path.resolve(vaultPath);
+  const configMgr = new ConfigManager(dataDir);
+
+  // Apply env var overrides (env takes priority over saved config on first boot,
+  // but config.json is the source of truth after that)
+  const currentCfg = configMgr.get();
+  const initialConfig: Config = {
+    port: envPort || currentCfg.port || 2768,
+    bindAddress: envBind || currentCfg.bindAddress || "0.0.0.0",
+    apiKey: envKey || currentCfg.apiKey,
+    allowedCommands: envAllowed || currentCfg.allowedCommands || "*",
+    vaultName: path.basename(resolvedVault),
+  };
+  configMgr.update(initialConfig);
+
+  let server: VaultMcpServer | null = null;
+
+  const callbacks: ServerCallbacks = {
+    getConfig: () => configMgr.get(),
+    updateConfig: (partial) => {
+      const updated = configMgr.update(partial);
+      return updated;
+    },
+    regenerateApiKey: () => {
+      const newKey = configMgr.regenerateApiKey();
+      return newKey;
+    },
+    restartMcp: async () => {
+      if (!server) return false;
+      await server.stopMcp();
+      const cfg = configMgr.get();
+      server["config"] = cfg;
+      await server.startMcp();
+      return true;
+    },
+    stopMcp: async () => {
+      if (!server) return false;
+      await server.stopMcp();
+      return true;
+    },
+    isMcpRunning: () => server?.running ?? false,
+    getMcpPort: () => configMgr.get().port,
+  };
+
+  const cfg = configMgr.get();
+  server = new VaultMcpServer(resolvedVault, cfg, callbacks);
+
+  console.log(`[vault-api] Vault:    ${resolvedVault}`);
+  console.log(`[vault-api] Data dir: ${dataDir}`);
+  console.log(`[vault-api] Port:     ${cfg.port}`);
+  console.log(`[vault-api] Bind:     ${cfg.bindAddress}`);
+  console.log(`[vault-api] API Key:  ${cfg.apiKey.substring(0, 8)}...${cfg.apiKey.substring(cfg.apiKey.length - 4)}`);
+  console.log(`[vault-api] Allowed:  ${cfg.allowedCommands}`);
 
   try {
-    await server.start();
-    console.log(`[vault-api] MCP server started on ${bindAddress}:${port}`);
-    console.log(`[vault-api] SSE URL: http://${bindAddress === "0.0.0.0" ? "localhost" : bindAddress}:${port}/sse?key=${apiKey}`);
+    await server.startHttp();
+    console.log(`[vault-api] HTTP server started on ${cfg.bindAddress}:${cfg.port}`);
+    console.log(`[vault-api] Web UI:  http://${cfg.bindAddress === "0.0.0.0" ? "localhost" : cfg.bindAddress}:${cfg.port}/`);
+
+    await server.startMcp();
+    console.log(`[vault-api] SSE URL: http://${cfg.bindAddress === "0.0.0.0" ? "localhost" : cfg.bindAddress}:${cfg.port}/sse?key=${cfg.apiKey}`);
   } catch (err) {
     console.error(`[vault-api] Failed to start: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
@@ -81,7 +113,10 @@ async function main() {
 
   const shutdown = async (signal: string) => {
     console.log(`[vault-api] Received ${signal}, shutting down...`);
-    await server.stop();
+    if (server) {
+      await server.stopMcp();
+      await server.stopHttp();
+    }
     process.exit(0);
   };
 

@@ -9,9 +9,12 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npx tsc
 
+RUN mkdir -p /vault /data
+
 EXPOSE 2768
 
 ENV VAULT_PATH=/vault
+ENV DATA_DIR=/data
 ENV VAULT_API_PORT=2768
 ENV VAULT_API_BIND=0.0.0.0
 ENV VAULT_API_KEY=
