@@ -1,0 +1,15 @@
+services:
+  vault-api:
+    build: .
+    container_name: obsidian-vault-api
+    restart: unless-stopped
+    ports:
+      - "2768:2768"
+    volumes:
+      - /path/to/your/vault:/vault
+    environment:
+      - VAULT_PATH=/vault
+      - VAULT_API_PORT=2768
+      - VAULT_API_BIND=0.0.0.0
+      - VAULT_API_KEY=
+      - VAULT_API_ALLOWED_COMMANDS=*

@@ -1,0 +1,33 @@
+{
+  "name": "obsidian-vault-api-docker",
+  "version": "1.0.0",
+  "description": "Docker-compatible version of Obsidian Vault API — exposes your vault as an MCP server. No Obsidian desktop required.",
+  "author": "Alexandre Ramos",
+  "license": "CC-BY-NC-SA-4.0",
+  "keywords": [
+    "obsidian",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "ai",
+    "vault",
+    "docker"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "main": "dist/index.js",
+  "type": "commonjs"
+}
