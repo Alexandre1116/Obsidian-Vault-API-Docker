@@ -520,6 +520,8 @@ export class VaultMcpServer {
     if (!this.apiKey) return true;
     const header = req.headers["x-api-key"];
     if (header === this.apiKey) return true;
+    const authHeader = req.headers["authorization"];
+    if (typeof authHeader === "string" && authHeader.startsWith("Bearer ") && authHeader.slice(7) === this.apiKey) return true;
     const url = new URL(req.url ?? "/", `http://${this.bindAddress}:${this.port}`);
     return url.searchParams.get("key") === this.apiKey;
   }
