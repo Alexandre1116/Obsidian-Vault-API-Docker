@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { VaultMcpServer, type ServerCallbacks } from "./server.js";
 import { ConfigManager } from "./config.js";
 import type { Config } from "./config.js";
+import { APP_VERSION } from "./version.js";
+import { UpdateManager } from "./updater.js";
 
 function getEnv(name: string, fallback?: string): string {
   const val = process.env[name];
@@ -28,6 +30,7 @@ async function main() {
   const envBind = getEnv("VAULT_API_BIND", "");
   const envKey = getEnv("VAULT_API_KEY");
   const envAllowed = getEnv("VAULT_API_ALLOWED_COMMANDS", "");
+  const envAutoUpdate = getEnv("VAULT_API_AUTO_UPDATE", "");
 
   if (!fs.existsSync(vaultPath)) {
     console.error(`[vault-api] ERROR: Vault path '${vaultPath}' does not exist.`);
@@ -46,6 +49,7 @@ async function main() {
   }
 
   const resolvedVault = path.resolve(vaultPath);
+  const hasSavedConfig = fs.existsSync(path.join(dataDir, "config.json"));
   const configMgr = new ConfigManager(dataDir);
 
   // Apply env var overrides (env takes priority over saved config on first boot,
@@ -57,10 +61,12 @@ async function main() {
     apiKey: envKey || currentCfg.apiKey,
     allowedCommands: envAllowed || currentCfg.allowedCommands || "*",
     vaultName: path.basename(resolvedVault),
+    autoUpdate: hasSavedConfig || envAutoUpdate === "" ? currentCfg.autoUpdate : envAutoUpdate.toLowerCase() === "true",
   };
   configMgr.update(initialConfig);
 
   let server: VaultMcpServer | null = null;
+  let updater: UpdateManager;
 
   const callbacks: ServerCallbacks = {
     getConfig: () => configMgr.get(),
@@ -87,10 +93,17 @@ async function main() {
     },
     isMcpRunning: () => server?.running ?? false,
     getMcpPort: () => configMgr.get().port,
+    getUpdateStatus: () => updater.getStatus(),
+    checkForUpdate: () => updater.check(),
+    updateNow: () => updater.updateNow(),
   };
 
   const cfg = configMgr.get();
   server = new VaultMcpServer(resolvedVault, cfg, callbacks);
+  updater = new UpdateManager(APP_VERSION, dataDir, () => configMgr.get().autoUpdate, () => {
+    console.log("[vault-api] Update installed. Restarting process...");
+    process.exit(0);
+  });
 
   console.log(`[vault-api] Vault:    ${resolvedVault}`);
   console.log(`[vault-api] Data dir: ${dataDir}`);
@@ -98,6 +111,7 @@ async function main() {
   console.log(`[vault-api] Bind:     ${cfg.bindAddress}`);
   console.log(`[vault-api] API Key:  ${cfg.apiKey.substring(0, 8)}...${cfg.apiKey.substring(cfg.apiKey.length - 4)}`);
   console.log(`[vault-api] Allowed:  ${cfg.allowedCommands}`);
+  console.log(`[vault-api] Version:  ${APP_VERSION}`);
 
   try {
     await server.startHttp();
@@ -106,6 +120,7 @@ async function main() {
 
     await server.startMcp();
     console.log(`[vault-api] SSE URL: http://${cfg.bindAddress === "0.0.0.0" ? "localhost" : cfg.bindAddress}:${cfg.port}/sse?key=${cfg.apiKey}`);
+    updater.start();
   } catch (err) {
     console.error(`[vault-api] Failed to start: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
