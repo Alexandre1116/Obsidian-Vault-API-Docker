@@ -1,4 +1,4 @@
-export function getDashboardHtml(port: number, apiKey: string, version: string): string {
+export function getDashboardHtml(port: number, apiKey: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -62,9 +62,6 @@ export function getDashboardHtml(port: number, apiKey: string, version: string):
   }
   .field input:focus { outline: none; border-color: var(--accent); }
   .field input:read-only { opacity: 0.6; }
-  .checkbox-field { display: flex; align-items: center; gap: 10px; }
-  .checkbox-field input { width: 18px; height: 18px; accent-color: var(--accent); }
-  .checkbox-field label { margin: 0; color: var(--text); font-size: 0.9rem; }
   .field .hint { font-size: 0.75rem; color: var(--text-dim); margin-top: 4px; }
   .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
   .btn {
@@ -142,28 +139,10 @@ export function getDashboardHtml(port: number, apiKey: string, version: string):
       <input type="text" id="allowedCommands" value="*">
       <div class="hint">Glob patterns for run_local_command, comma-separated. Use * for all</div>
     </div>
-    <div class="field checkbox-field">
-      <input type="checkbox" id="autoUpdate">
-      <label for="autoUpdate">Enable automatic updates</label>
-    </div>
-    <div class="hint">Check GitHub once a day and install newer stable versions automatically.</div>
     <div class="btn-row">
       <button class="btn btn-primary" onclick="saveConfig()">Save & Restart</button>
       <button class="btn btn-ghost" onclick="loadConfig()">Reload</button>
     </div>
-  </div>
-
-  <div class="card">
-    <h2>Updates</h2>
-    <div class="info-box">
-      <div><span class="label">Installed:</span> <span id="installedVersion">${version}</span></div>
-      <div><span class="label">Latest:</span> <span id="latestVersion">Not checked</span></div>
-      <div><span class="label">Status:</span> <span id="updateStatus">Not checked</span></div>
-    </div>
-    <div class="btn-row">
-      <button class="btn btn-primary" id="updateButton" onclick="updateNow()">Update now</button>
-    </div>
-    <div class="hint">The server restarts after a successful update.</div>
   </div>
 
   <div class="card">
@@ -218,7 +197,7 @@ export function getDashboardHtml(port: number, apiKey: string, version: string):
   </div>
 
   <footer>
-    <p>Vault API Docker v${version} &mdash; <a href="https://github.com/Alexandre1116/Obsidian-Vault-API-Docker" target="_blank">GitHub</a></p>
+    <p>Vault API Docker v1.1.0 &mdash; <a href="https://github.com/Alexandre1116/Obsidian-Vault-API-Docker" target="_blank">GitHub</a></p>
   </footer>
 </div>
 
@@ -278,7 +257,6 @@ async function loadConfig() {
     document.getElementById('port').value = cfg.port;
     document.getElementById('bindAddress').value = cfg.bindAddress;
     document.getElementById('allowedCommands').value = cfg.allowedCommands;
-    document.getElementById('autoUpdate').checked = cfg.autoUpdate === true;
     document.getElementById('apiKey').value = cfg.apiKey;
     updateUrls(cfg.port, cfg.apiKey);
     window.sseUrlText = 'http://' + location.hostname + ':' + cfg.port + '/sse?key=' + cfg.apiKey;
@@ -292,7 +270,6 @@ async function saveConfig() {
     port: parseInt(document.getElementById('port').value),
     bindAddress: document.getElementById('bindAddress').value,
     allowedCommands: document.getElementById('allowedCommands').value,
-    autoUpdate: document.getElementById('autoUpdate').checked,
   };
   try {
     const resp = await fetch('/api/config', {
@@ -309,54 +286,6 @@ async function saveConfig() {
     }
   } catch (e) {
     showToast('Save failed', 'error');
-  }
-}
-
-function renderUpdateStatus(status) {
-  document.getElementById('installedVersion').textContent = 'v' + status.currentVersion;
-  document.getElementById('latestVersion').textContent = status.latestVersion ? 'v' + status.latestVersion : 'Not checked';
-  const statusEl = document.getElementById('updateStatus');
-  if (status.updating) statusEl.textContent = 'Updating...';
-  else if (status.lastError) statusEl.textContent = 'Error: ' + status.lastError;
-  else if (status.updateAvailable) statusEl.textContent = 'Update available';
-  else if (status.lastCheckedAt) statusEl.textContent = 'Up to date';
-  else statusEl.textContent = 'Not checked';
-}
-
-async function loadUpdateStatus() {
-  try {
-    const resp = await fetch('/api/update');
-    renderUpdateStatus(await resp.json());
-  } catch (e) {
-    document.getElementById('updateStatus').textContent = 'Unavailable';
-  }
-}
-
-async function updateNow() {
-  const button = document.getElementById('updateButton');
-  button.disabled = true;
-  button.textContent = 'Checking...';
-  try {
-    const resp = await fetch('/api/update', { method: 'POST' });
-    const result = await resp.json();
-    renderUpdateStatus(result);
-    if (result.updated) {
-      showToast(result.message);
-      button.textContent = 'Restarting...';
-      setTimeout(() => loadStatus(), 2000);
-    } else if (resp.ok) {
-      showToast(result.message);
-      button.disabled = false;
-      button.textContent = 'Update now';
-    } else {
-      showToast('Update failed: ' + result.message, 'error');
-      button.disabled = false;
-      button.textContent = 'Update now';
-    }
-  } catch (e) {
-    showToast('Update failed', 'error');
-    button.disabled = false;
-    button.textContent = 'Update now';
   }
 }
 
@@ -425,7 +354,6 @@ async function loadStatus() {
 
 loadStatus();
 loadConfig();
-loadUpdateStatus();
 </script>
 </body>
 </html>`;

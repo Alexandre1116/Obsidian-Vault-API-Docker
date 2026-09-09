@@ -15,7 +15,6 @@ services:
       - VAULT_API_BIND=0.0.0.0
       - VAULT_API_KEY=
       - VAULT_API_ALLOWED_COMMANDS=*
-      - VAULT_API_AUTO_UPDATE=false
 
 volumes:
   vault-api-data:

@@ -8,7 +8,6 @@ export interface Config {
   apiKey: string;
   allowedCommands: string;
   vaultName: string;
-  autoUpdate: boolean;
 }
 
 const DEFAULTS: Config = {
@@ -17,7 +16,6 @@ const DEFAULTS: Config = {
   apiKey: "",
   allowedCommands: "*",
   vaultName: "",
-  autoUpdate: false,
 };
 
 export class ConfigManager {

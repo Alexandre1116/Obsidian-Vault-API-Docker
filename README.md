@@ -68,8 +68,6 @@ The dashboard lets you:
 - **View server status** (running/stopped, port, vault name)
 - **Edit configuration** (port, bind address, allowed commands) — changes are saved to `/data/config.json` and persist across restarts
 - **Regenerate API key** — generates a new secret, requires reconnecting clients
-- **Automatic updates** — optionally checks GitHub once a day and installs newer stable versions
-- **Manual updates** — checks for and installs the latest stable GitHub version from the Updates card
 - **Restart / Stop** the MCP server without stopping the container
 - **Copy connection info** — SSE URL, Claude Desktop JSON config, API key
 
@@ -87,10 +85,7 @@ Configuration is stored in `/data/config.json` and persists across container res
 | `VAULT_API_BIND` | `0.0.0.0` | Bind address (`0.0.0.0` for Docker / network access) |
 | `VAULT_API_KEY` | *(auto-generated)* | API key for MCP authentication. If empty, one is generated and saved |
 | `VAULT_API_ALLOWED_COMMANDS` | `*` | Glob patterns for allowed shell commands (comma-separated). `*` = all |
-| `VAULT_API_AUTO_UPDATE` | `false` | Enable daily GitHub update checks on first boot. The Web UI setting is saved in `/data/config.json` |
 | `VAULT_API_HOST` | `127.0.0.1:2768` | Host reported in image URLs (set to your external address if behind a proxy) |
-
-Automatic updates use the latest stable GitHub release, or the newest semantic-version tag when no release is available. The server downloads the source, builds it inside the container, replaces the compiled application, and exits so Docker can restart it. Keep `restart: unless-stopped` enabled for automatic restarts.
 
 ## Connecting Your AI Client
 
@@ -176,7 +171,7 @@ volumes:
 curl http://localhost:2768/health
 ```
 
-Returns `{ "status": "ok", "version": "1.1.2" }` publicly. Authenticated requests also return `vault`, `port`, and `sessions`.
+Returns `{ "status": "ok", "version": "1.1.0" }` publicly. Authenticated requests also return `vault`, `port`, and `sessions`.
 
 ## Building from Source
 
