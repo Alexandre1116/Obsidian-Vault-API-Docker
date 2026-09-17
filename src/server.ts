@@ -9,6 +9,8 @@ import { exec } from "node:child_process";
 import { VaultTools } from "./vault-tools.js";
 import { getDashboardHtml } from "./web-ui.js";
 import type { Config } from "./config.js";
+import { APP_VERSION } from "./version.js";
+import type { UpdateResult, UpdateStatus } from "./updater.js";
 
 const SSE_KEEPALIVE_MS = 15_000;
 
@@ -76,6 +78,9 @@ export interface ServerCallbacks {
   stopMcp: () => Promise<boolean>;
   isMcpRunning: () => boolean;
   getMcpPort: () => number;
+  getUpdateStatus: () => UpdateStatus;
+  checkForUpdate: () => Promise<UpdateStatus>;
+  updateNow: () => Promise<UpdateResult>;
 }
 
 export class VaultMcpServer {
@@ -103,7 +108,7 @@ export class VaultMcpServer {
 
   private createMcpInstance(): Server {
     const mcp = new Server(
-      { name: "obsidian-vault-api-docker", version: "1.1.0" },
+      { name: "obsidian-vault-api-docker", version: APP_VERSION },
       { capabilities: { tools: {} } }
     );
     this.registerTools(mcp);
@@ -541,7 +546,7 @@ export class VaultMcpServer {
     if (url.pathname === "/" || url.pathname === "/ui" || url.pathname === "/dashboard") {
       const cfg = this.callbacks.getConfig();
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(getDashboardHtml(cfg.port, cfg.apiKey));
+      res.end(getDashboardHtml(cfg.port, cfg.apiKey, APP_VERSION));
       return;
     }
 
@@ -552,7 +557,28 @@ export class VaultMcpServer {
         running: this.callbacks.isMcpRunning(),
         port: this.callbacks.getMcpPort(),
         vault: this.vaultName,
+        version: APP_VERSION,
       }));
+      return;
+    }
+
+    if (url.pathname === "/api/update" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(this.callbacks.getUpdateStatus()));
+      return;
+    }
+
+    if (url.pathname === "/api/update/check" && req.method === "POST") {
+      const status = await this.callbacks.checkForUpdate();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(status));
+      return;
+    }
+
+    if (url.pathname === "/api/update" && req.method === "POST") {
+      const result = await this.callbacks.updateNow();
+      res.writeHead(result.lastError ? 500 : 200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
       return;
     }
 
@@ -575,8 +601,10 @@ export class VaultMcpServer {
           }
           if (partial.bindAddress !== undefined && typeof partial.bindAddress !== "string") throw new Error("Invalid bindAddress");
           if (partial.allowedCommands !== undefined && typeof partial.allowedCommands !== "string") throw new Error("Invalid allowedCommands");
+          if (partial.autoUpdate !== undefined && typeof partial.autoUpdate !== "boolean") throw new Error("Invalid autoUpdate");
 
           const updated = this.callbacks.updateConfig(partial);
+          this.config = updated;
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, config: updated }));
         } catch (err) {
@@ -623,7 +651,7 @@ export class VaultMcpServer {
 
     if (url.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      const body: Record<string, unknown> = { status: "ok", version: "1.1.0" };
+      const body: Record<string, unknown> = { status: "ok", version: APP_VERSION };
       if (this.authed(req)) {
         body.vault = this.vaultName;
         body.port = this.port;

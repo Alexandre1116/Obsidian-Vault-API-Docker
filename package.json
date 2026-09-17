@@ -1,6 +1,6 @@
 {
   "name": "obsidian-vault-api-docker",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "description": "Docker-compatible version of Obsidian Vault API — exposes your vault as an MCP server. No Obsidian desktop required.",
   "author": "Alexandre Ramos",
   "license": "CC-BY-NC-SA-4.0",
