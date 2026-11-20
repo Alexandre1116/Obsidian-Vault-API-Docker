@@ -8,14 +8,37 @@ services:
     volumes:
       - /path/to/your/vault:/vault
       - vault-api-data:/data
+    # Put VAULT_API_KEY in a .env file next to this compose file and protect it
+    # with: chmod 600 .env. Keeping the key in this file means it ends up in
+    # shell history, backups and git.
+    env_file:
+      - .env
     environment:
       - VAULT_PATH=/vault
       - DATA_DIR=/data
       - VAULT_API_PORT=2768
       - VAULT_API_BIND=0.0.0.0
-      - VAULT_API_KEY=
-      - VAULT_API_ALLOWED_COMMANDS=*
-      - VAULT_API_AUTO_UPDATE=false
+      - VAULT_API_ALLOWED_COMMANDS=pdftotext,pandoc,git,ls,find,grep,stat
+      - VAULT_API_MANAGEMENT_AUTH=true
+    # Blast radius: on a small host the default is unlimited memory, so one bad
+    # read can get the whole container group OOM-killed.
+    mem_limit: 512m
+    pids_limit: 256
+    init: true
+    stop_grace_period: 15s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Skip read_only if you use the in-container auto-update, which writes to /app.
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   vault-api-data:

@@ -34,13 +34,17 @@ services:
       - /path/to/your/vault:/vault
       - vault-api-data:/data
     environment:
-      - VAULT_API_KEY=your-secret-key-here
+      - VAULT_API_ALLOWED_COMMANDS=pdftotext,pandoc,git,ls,find,grep,stat
+    env_file:
+      - .env
+    mem_limit: 512m
 
 volumes:
   vault-api-data:
 ```
 
 ```bash
+cp .env.example .env   # set VAULT_API_KEY, then: chmod 600 .env
 docker compose up -d
 ```
 
@@ -73,7 +77,16 @@ The dashboard lets you:
 - **Restart / Stop** the MCP server without stopping the container
 - **Copy connection info** — SSE URL, Claude Desktop JSON config, API key
 
-The web UI itself does not require authentication (it's the config page). The MCP endpoints (`/sse`, `/message`, `/raw`) require the API key.
+The dashboard page itself contains no secret: the server never sends the API key to the browser. Paste the key once per browser session (it is kept in `sessionStorage`) and the dashboard will use it as `X-Api-Key` for the management API. MCP endpoints (`/sse`, `/message`, `/raw`) and all `/api/*` management routes require the API key. Set `VAULT_API_MANAGEMENT_AUTH=false` only if something in front of the container already handles access control.
+
+## Security notes
+
+- The API key grants file access and shell access. Treat it like a password: keep it in `.env` (`chmod 600 .env`), never in the compose file, and rotate it from the dashboard if it leaks.
+- The key is not printed in logs, not returned by `GET /api/config`, and `/data/config.json` is saved with mode `0600`.
+- Image results give a short-lived signed `/raw` URL (`token=`, 15 minutes) instead of embedding the key, so the credential never enters the model context.
+- `VAULT_API_ALLOWED_COMMANDS` defaults to `*` for compatibility. Prefer an explicit allowlist; `run_local_command` runs inside the container with the vault mounted.
+- Bind to a trusted interface (`VAULT_API_BIND`), or restrict the port with your firewall. The container drops all capabilities, is read-only and cannot escalate privileges in the shipped compose file.
+- `delete_file` and `delete_folder` move content to `.trash/` inside the vault. Set `VAULT_API_TRASH_DIR=` (empty) for permanent deletion.
 
 ## Configuration
 
@@ -88,9 +101,20 @@ Configuration is stored in `/data/config.json` and persists across container res
 | `VAULT_API_KEY` | *(auto-generated)* | API key for MCP authentication. If empty, one is generated and saved |
 | `VAULT_API_ALLOWED_COMMANDS` | `*` | Glob patterns for allowed shell commands (comma-separated). `*` = all |
 | `VAULT_API_AUTO_UPDATE` | `false` | Enable daily GitHub update checks on first boot. The Web UI setting is saved in `/data/config.json` |
+| `VAULT_API_MANAGEMENT_AUTH` | `true` | Require the API key for the dashboard's management API (`/api/*`) |
 | `VAULT_API_HOST` | `127.0.0.1:2768` | Host reported in image URLs (set to your external address if behind a proxy) |
+| `VAULT_API_TRASH_DIR` | `.trash` | Vault-relative trash for deletions. Empty = permanent delete |
+| `VAULT_API_MAX_SCAN_FILE_BYTES` | `2097152` | Largest file `search` will open |
+| `VAULT_API_MAX_TEXT_BYTES` | `4194304` | Largest file `read_file` returns as text |
+| `VAULT_API_MAX_BINARY_BYTES` | `33554432` | Largest file returned as base64, and largest `write_binary` payload |
+| `VAULT_API_MAX_WALK_ENTRIES` | `20000` | Entries one `list_files`/`search` call may visit |
+| `VAULT_API_MAX_SCAN_TOTAL_BYTES` | `33554432` | Total bytes one `search` call may read |
 
-Automatic updates use the latest stable GitHub release, or the newest semantic-version tag when no release is available. The server downloads the source, builds it inside the container, replaces the compiled application, and exits so Docker can restart it. Keep `restart: unless-stopped` enabled for automatic restarts.
+These limits exist because vaults are often shared with course media and backups. A single 5 GB `.iso` read as UTF-8 text is enough to have the kernel OOM-kill the process on a small host; the defaults keep one tool call inside a few tens of MB. When a budget stops a scan, the result says `partial: true` and explains why.
+
+Environment variables are **initial defaults only**: once `/data/config.json` exists it wins, so a rotated API key is not overwritten by the compose file on the next restart.
+
+Automatic updates use the latest stable GitHub release, or the newest semantic-version tag when no release is available. The server downloads the source, builds it inside the container, replaces the compiled application, and exits so Docker can restart it. Keep `restart: unless-stopped` enabled for automatic restarts. The updater verifies the downloaded version matches the tag, refuses to build when the container has too little free memory, and rolls `dist/`, `node_modules/` and the manifest back if the new build does not load. In-container updates need `read_only: false`.
 
 ## Connecting Your AI Client
 
@@ -202,7 +226,7 @@ VAULT_PATH=/path/to/vault VAULT_API_KEY=secret npm start
 | **Runtime** | Inside Obsidian desktop app | Standalone Node.js in Docker |
 | **File access** | Obsidian Vault API (`app.vault`) | Node.js `fs` |
 | **Image resize** | Electron Canvas API | `sharp` (native, no GUI dependency) |
-| **File deletion** | System trash (recoverable) | Permanent delete |
+| **File deletion** | System trash (recoverable) | `.trash/` inside the vault (recoverable; configurable) |
 | **Settings UI** | Obsidian settings tab | Web UI at `http://host:2768/` |
 | **Config storage** | Obsidian plugin data | `/data/config.json` (Docker volume) |
 | **Bind address** | `127.0.0.1` only | Configurable (`0.0.0.0` by default) |
