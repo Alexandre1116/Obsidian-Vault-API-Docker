@@ -206,6 +206,28 @@ export class VaultTools {
 
   // ── read_file ──────────────────────────────────────────────────────────
 
+  /**
+   * Reads a file as UTF-8 text with the size checked both before opening it and
+   * after decoding. The second check matters: an SVG with embedded base64
+   * images, or a file whose size changed since the listing, can decode far
+   * above the limit and allocate anyway.
+   */
+  private async readTextCapped(abs: string, sizeBytes: number, sizeMB: string): Promise<string> {
+    if (sizeBytes > this.limits.maxTextReadBytes)
+      throw new VaultError(
+        `Text file too large to read (${sizeMB}, limit ${formatMegabytes(this.limits.maxTextReadBytes)}). ` +
+        "Use run_local_command with grep/awk, or raise VAULT_API_MAX_TEXT_BYTES."
+      );
+    const content = await fs.promises.readFile(abs, "utf-8");
+    const decoded = Buffer.byteLength(content);
+    if (decoded > this.limits.maxTextReadBytes)
+      throw new VaultError(
+        `Text file decodes above the limit (${formatMegabytes(decoded)}, ` +
+        `limit ${formatMegabytes(this.limits.maxTextReadBytes)}). Use run_local_command with grep/awk.`
+      );
+    return content;
+  }
+
   async readFile(path: string): Promise<
     | { type: "text"; content: string }
     | { type: "image"; mimeType: string; data: string; note?: string }
@@ -219,7 +241,7 @@ export class VaultTools {
     const sizeMB = formatMegabytes(st.size);
     const cls = classifyExtension(path);
 
-    if (cls === "svg") return { type: "text", content: await fs.promises.readFile(abs, "utf-8") };
+    if (cls === "svg") return { type: "text", content: await this.readTextCapped(abs, st.size, sizeMB) };
 
     if (cls === "image") {
       if (st.size > RESIZE_THRESHOLD) {
@@ -242,14 +264,7 @@ export class VaultTools {
 
     const textLike = cls === "text" || (cls === "unknown" && await this.readSniff(abs));
 
-    if (textLike) {
-      if (st.size > this.limits.maxTextReadBytes)
-        throw new VaultError(
-          `Text file too large to read (${sizeMB}, limit ${formatMegabytes(this.limits.maxTextReadBytes)}). ` +
-          "Use run_local_command with grep/awk, or raise VAULT_API_MAX_TEXT_BYTES."
-        );
-      return { type: "text", content: await fs.promises.readFile(abs, "utf-8") };
-    }
+    if (textLike) return { type: "text", content: await this.readTextCapped(abs, st.size, sizeMB) };
 
     if (st.size > this.limits.maxBinaryReadBytes)
       throw new VaultError(

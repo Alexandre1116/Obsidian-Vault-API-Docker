@@ -141,6 +141,20 @@ describe("writes and deletion", () => {
   it("refuses to read a text file above the size limit", async () => {
     await expect(tools.readFile("notes/huge.md")).rejects.toThrow(/too large to read/);
   });
+
+  it("applies the text limit to SVG, which used to bypass it", async () => {
+    write("assets/big.svg", `<svg xmlns="http://www.w3.org/2000/svg">${"x".repeat(200 * 1024)}</svg>`);
+    await expect(tools.readFile("assets/big.svg")).rejects.toThrow(/too large to read/);
+    expect(fs.existsSync(path.join(root, "assets/big.svg"))).toBe(true);
+  });
+
+  it("checks the size before opening, for every text branch", async () => {
+    const tiny = new VaultTools(root, { ...LIMITS, maxTextReadBytes: 32 });
+    write("assets/small.svg", "<svg><text>this svg is longer than sixty-four bytes</text></svg>");
+    write("notes/small.md", "# note\nsome content that is longer than sixty-four bytes in total\n");
+    await expect(tiny.readFile("assets/small.svg")).rejects.toThrow(/too large to read/);
+    await expect(tiny.readFile("notes/small.md")).rejects.toThrow(/too large to read/);
+  });
 });
 
 describe("frontmatter through the tool surface", () => {
