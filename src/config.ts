@@ -9,6 +9,8 @@ export interface Config {
   allowedCommands: string;
   vaultName: string;
   autoUpdate: boolean;
+  /** When true, the dashboard and /api/* management routes require the API key. */
+  managementAuth: boolean;
 }
 
 const DEFAULTS: Config = {
@@ -18,6 +20,7 @@ const DEFAULTS: Config = {
   allowedCommands: "*",
   vaultName: "",
   autoUpdate: false,
+  managementAuth: true,
 };
 
 export class ConfigManager {
@@ -49,7 +52,9 @@ export class ConfigManager {
   save(): void {
     const dir = nodePath.dirname(this.configPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), "utf-8");
+    // The file holds the API key, so it must not be world readable.
+    fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), { encoding: "utf-8", mode: 0o600 });
+    try { fs.chmodSync(this.configPath, 0o600); } catch { /* non-POSIX filesystem */ }
   }
 
   get(): Config {
@@ -67,4 +72,51 @@ export class ConfigManager {
     this.save();
     return this.config.apiKey;
   }
+}
+
+/** Short, non-reversible form for logs and status output. */
+export function maskKey(key: string): string {
+  if (!key) return "(none)";
+  if (key.length <= 12) return "***";
+  return `${key.slice(0, 4)}…${key.slice(-4)}`;
+}
+
+/** Shape safe to send to the browser: never carries the key itself. */
+export function publicConfig(cfg: Config): Omit<Config, "apiKey"> & { apiKeyHint: string; hasApiKey: boolean } {
+  const { apiKey, ...rest } = cfg;
+  return { ...rest, apiKeyHint: maskKey(apiKey), hasApiKey: Boolean(apiKey) };
+}
+
+export interface EnvOverrides {
+  port?: number;
+  bindAddress?: string;
+  apiKey?: string;
+  allowedCommands?: string;
+  autoUpdate?: string;
+  managementAuth?: string;
+  vaultName: string;
+}
+
+/**
+ * Environment variables are initial defaults only. Once config.json exists it
+ * wins, otherwise a rotated API key would be overwritten by the compose file
+ * on every container restart.
+ */
+export function resolveInitialConfig(saved: Config, hasSavedConfig: boolean, env: EnvOverrides): Config {
+  if (hasSavedConfig) {
+    return {
+      ...saved,
+      vaultName: env.vaultName,
+      autoUpdate: saved.autoUpdate,
+    };
+  }
+  return {
+    port: env.port && env.port > 0 ? env.port : 2768,
+    bindAddress: env.bindAddress || "0.0.0.0",
+    apiKey: env.apiKey || saved.apiKey,
+    allowedCommands: env.allowedCommands || "*",
+    vaultName: env.vaultName,
+    autoUpdate: (env.autoUpdate ?? "").toLowerCase() === "true",
+    managementAuth: (env.managementAuth ?? "true").toLowerCase() !== "false",
+  };
 }

@@ -1,4 +1,4 @@
-export function getDashboardHtml(port: number, apiKey: string, version: string): string {
+export function getDashboardHtml(port: number, apiKeyHint: string, version: string, managementAuth = true): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -169,10 +169,12 @@ export function getDashboardHtml(port: number, apiKey: string, version: string):
   <div class="card">
     <h2>API Key</h2>
     <div class="field">
-      <label>Current Key</label>
-      <input type="text" id="apiKey" value="${apiKey}" readonly>
+      <label>Key (not shown by the server)</label>
+      <input type="password" id="apiKey" placeholder="Paste your API key to configure clients" autocomplete="off">
     </div>
+    <div class="hint">Current key fingerprint: <strong>${apiKeyHint}</strong>. Paste the key once per browser session; it is kept in sessionStorage only.</div>
     <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveEnteredKey()">Use this key</button>
       <button class="btn btn-warning" onclick="regenerateKey()">Regenerate Key</button>
       <button class="btn btn-ghost" onclick="copyKey()">Copy</button>
     </div>
@@ -226,7 +228,65 @@ export function getDashboardHtml(port: number, apiKey: string, version: string):
 
 <script>
 const INITIAL_PORT = ${port};
-const INITIAL_KEY = "${apiKey}";
+const MANAGEMENT_AUTH = ${managementAuth};
+
+function getApiKey() {
+  try { return sessionStorage.getItem('vaultApiKey') || ''; } catch (e) { return ''; }
+}
+
+function setEnteredKey(key) {
+  try { sessionStorage.setItem('vaultApiKey', key); } catch (e) {}
+  refreshUrls();
+}
+
+function saveEnteredKey() {
+  const key = document.getElementById('apiKey').value.trim();
+  if (!key) { showToast('Paste the API key first', 'error'); return; }
+  setEnteredKey(key);
+  showToast('Key stored for this browser session');
+  loadConfig();
+}
+
+function authHeaders() {
+  const key = getApiKey();
+  return key ? { 'X-Api-Key': key } : {};
+}
+
+async function apiFetch(url, options) {
+  const opts = Object.assign({}, options || {});
+  opts.headers = Object.assign({}, opts.headers || {}, authHeaders());
+  const resp = await fetch(url, opts);
+  if (resp.status === 401) showToast('API key required: paste it in the API Key card first', 'error');
+  return resp;
+}
+
+function maskedKey(key) {
+  if (!key) return '<YOUR_API_KEY>';
+  if (key.length <= 12) return key;
+  return key.slice(0, 4) + '...' + key.slice(-4);
+}
+
+function connectionKey() {
+  // Show the real key only when the operator typed it in this session.
+  return getApiKey() || '<YOUR_API_KEY>';
+}
+
+function refreshUrls() {
+  const port = document.getElementById('port') ? document.getElementById('port').value : INITIAL_PORT;
+  const key = connectionKey();
+  const base = 'http://' + location.hostname + ':' + port;
+  document.getElementById('sseUrl').textContent = base + '/sse?key=' + key;
+  document.getElementById('healthUrl').textContent = base + '/health';
+  window.sseUrlText = base + '/sse?key=' + key;
+  window.claudeConfig = JSON.stringify({
+    mcpServers: { obsidian: { url: 'http://' + location.hostname + ':' + port + '/sse?key=' + key } }
+  }, null, 2);
+}
+
+function updateUrls(port) {
+  document.getElementById('port').value = port;
+  refreshUrls();
+}
 
 function showToast(msg, type) {
   const el = document.getElementById('toast');
@@ -235,53 +295,31 @@ function showToast(msg, type) {
   setTimeout(() => el.classList.remove('show'), 2500);
 }
 
-function updateUrls(port, key) {
-  const host = location.hostname;
-  const base = 'http://' + host + ':' + port;
-  document.getElementById('sseUrl').textContent = base + '/sse?key=' + key;
-  document.getElementById('healthUrl').textContent = base + '/health';
-  document.getElementById('apiKey').value = key;
-  document.getElementById('port').value = port;
-}
-window.sseUrlText = 'http://' + location.hostname + ':' + INITIAL_PORT + '/sse?key=' + INITIAL_KEY;
-window.claudeConfig = JSON.stringify({
-  mcpServers: {
-    obsidian: { url: 'http://localhost:' + INITIAL_PORT + '/sse?key=' + INITIAL_KEY }
-  }
-}, null, 2);
-
 function copyText(id) {
   const text = window[id] || document.getElementById(id).textContent;
   navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
 }
 
 function copyKey() {
-  const key = document.getElementById('apiKey').value;
+  const key = getApiKey();
+  if (!key) { showToast('The server never sends the key to the browser: paste it once, then copy', 'error'); return; }
   navigator.clipboard.writeText(key).then(() => showToast('API key copied!'));
 }
 
 function copyClaudeConfig() {
-  const port = document.getElementById('port').value;
-  const key = document.getElementById('apiKey').value;
-  const cfg = JSON.stringify({
-    mcpServers: {
-      obsidian: { url: 'http://localhost:' + port + '/sse?key=' + key }
-    }
-  }, null, 2);
-  navigator.clipboard.writeText(cfg).then(() => showToast('Claude config copied!'));
+  navigator.clipboard.writeText(window.claudeConfig || '').then(() => showToast('Claude config copied!'));
 }
 
 async function loadConfig() {
   try {
-    const resp = await fetch('/api/config');
+    const resp = await apiFetch('/api/config');
+    if (!resp.ok) return;
     const cfg = await resp.json();
     document.getElementById('port').value = cfg.port;
     document.getElementById('bindAddress').value = cfg.bindAddress;
     document.getElementById('allowedCommands').value = cfg.allowedCommands;
     document.getElementById('autoUpdate').checked = cfg.autoUpdate === true;
-    document.getElementById('apiKey').value = cfg.apiKey;
-    updateUrls(cfg.port, cfg.apiKey);
-    window.sseUrlText = 'http://' + location.hostname + ':' + cfg.port + '/sse?key=' + cfg.apiKey;
+    updateUrls(cfg.port);
   } catch (e) {
     showToast('Failed to load config', 'error');
   }
@@ -295,7 +333,7 @@ async function saveConfig() {
     autoUpdate: document.getElementById('autoUpdate').checked,
   };
   try {
-    const resp = await fetch('/api/config', {
+    const resp = await apiFetch('/api/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cfg)
@@ -325,7 +363,7 @@ function renderUpdateStatus(status) {
 
 async function loadUpdateStatus() {
   try {
-    const resp = await fetch('/api/update');
+    const resp = await apiFetch('/api/update');
     renderUpdateStatus(await resp.json());
   } catch (e) {
     document.getElementById('updateStatus').textContent = 'Unavailable';
@@ -337,7 +375,7 @@ async function updateNow() {
   button.disabled = true;
   button.textContent = 'Checking...';
   try {
-    const resp = await fetch('/api/update', { method: 'POST' });
+    const resp = await apiFetch('/api/update', { method: 'POST' });
     const result = await resp.json();
     renderUpdateStatus(result);
     if (result.updated) {
@@ -363,12 +401,14 @@ async function updateNow() {
 async function regenerateKey() {
   if (!confirm('Regenerate API key? All connected clients will need to reconnect.')) return;
   try {
-    const resp = await fetch('/api/key/regenerate', { method: 'POST' });
+    const resp = await apiFetch('/api/key/regenerate', { method: 'POST' });
     const result = await resp.json();
     if (result.apiKey) {
       document.getElementById('apiKey').value = result.apiKey;
-      updateUrls(parseInt(document.getElementById('port').value), result.apiKey);
-      showToast('Key regenerated! Update your clients.');
+      setEnteredKey(result.apiKey);
+      showToast('Key regenerated! Copy it now - the server will not show it again.');
+    } else {
+      showToast('Regenerate failed', 'error');
     }
   } catch (e) {
     showToast('Failed to regenerate key', 'error');
@@ -377,7 +417,7 @@ async function regenerateKey() {
 
 async function restartServer() {
   try {
-    const resp = await fetch('/api/server/restart', { method: 'POST' });
+    const resp = await apiFetch('/api/server/restart', { method: 'POST' });
     const result = await resp.json();
     if (result.ok) {
       showToast('Server restarting...');
@@ -393,7 +433,7 @@ async function restartServer() {
 async function stopServer() {
   if (!confirm('Stop the MCP server? The web UI will remain active.')) return;
   try {
-    const resp = await fetch('/api/server/stop', { method: 'POST' });
+    const resp = await apiFetch('/api/server/stop', { method: 'POST' });
     const result = await resp.json();
     if (result.ok) {
       showToast('Server stopped');
@@ -406,7 +446,7 @@ async function stopServer() {
 
 async function loadStatus() {
   try {
-    const resp = await fetch('/api/status');
+    const resp = await apiFetch('/api/status');
     const status = await resp.json();
     const badge = document.getElementById('statusBadge');
     const text = document.getElementById('statusText');
