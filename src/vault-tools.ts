@@ -1,26 +1,26 @@
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
+import * as readline from "node:readline";
 import sharp from "sharp";
-
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"]);
-const SVG_EXTS = new Set(["svg"]);
-
-const BINARY_EXTS = new Set([
-  "pdf", "docx", "xlsx", "pptx", "zip", "rar", "7z", "gz", "tar",
-  "mp3", "mp4", "wav", "ogg", "flac", "avi", "mkv", "mov", "wmv",
-  "exe", "dll", "so", "dylib", "wasm",
-  "sqlite", "db",
-  "ttf", "otf", "woff", "woff2", "eot",
-]);
+import {
+  classifyExtension,
+  extensionOf,
+  formatMegabytes,
+  isIgnoredPath,
+  limitsFromEnv,
+  looksLikeText,
+  shouldScanContent,
+  type ScanLimits,
+} from "./vault-policy.js";
+import {
+  applyFrontmatterUpdates,
+  parseFrontmatterValues,
+  renderFrontmatter,
+  splitFrontmatter,
+} from "./vault-frontmatter.js";
 
 const RESIZE_THRESHOLD = 4 * 1024 * 1024;
-const MAX_BINARY_BYTES = 500 * 1024 * 1024;
-
-function maxDimForSize(bytes: number): number {
-  if (bytes > 100 * 1024 * 1024) return 512;
-  if (bytes > 20 * 1024 * 1024) return 800;
-  return 1024;
-}
+const SNIFF_BYTES = 4096;
 
 function mimeType(ext: string): string {
   const t: Record<string, string> = {
@@ -37,293 +37,493 @@ function mimeType(ext: string): string {
   return t[ext.toLowerCase()] ?? "application/octet-stream";
 }
 
+function maxDimForSize(bytes: number): number {
+  if (bytes > 100 * 1024 * 1024) return 512;
+  if (bytes > 20 * 1024 * 1024) return 800;
+  return 1024;
+}
+
+export class VaultError extends Error {}
+
+interface WalkEntry { rel: string; abs: string; size: number; mtimeMs: number; }
+interface WalkResult { entries: WalkEntry[]; truncated: boolean; ignored: number; }
+
 export class VaultTools {
-  constructor(private vaultBase: string) {}
+  private readonly limits: ScanLimits;
 
-  private resolve(path: string): string {
-    const resolved = nodePath.resolve(this.vaultBase, path);
-    if (!resolved.startsWith(this.vaultBase)) {
-      throw new Error(`Path traversal detected: '${path}' resolves outside the vault`);
-    }
-    return resolved;
+  constructor(
+    private vaultBase: string,
+    limits: ScanLimits = limitsFromEnv()
+  ) {
+    this.limits = limits;
   }
 
-  private stat(path: string): { exists: boolean; isFile: boolean; isDir: boolean; size: number; mtime: number } {
-    const abs = this.resolve(path);
+  get scanLimits(): ScanLimits { return this.limits; }
+
+  // ── Path safety ────────────────────────────────────────────────────────
+  //
+  // Every access resolves against the real vault root and refuses anything
+  // that lands outside it, including through a symlink placed inside the vault.
+
+  private async baseRealPath(): Promise<string> {
+    return fs.promises.realpath(this.vaultBase);
+  }
+
+  private isInside(base: string, target: string): boolean {
+    return target === base || target.startsWith(base + nodePath.sep);
+  }
+
+  async resolveSafe(vaultRelativePath: string): Promise<string> {
+    if (typeof vaultRelativePath !== "string" || vaultRelativePath === "")
+      throw new VaultError("'path' must be a non-empty string");
+    if (vaultRelativePath.includes("\0"))
+      throw new VaultError("'path' must not contain NUL bytes");
+    if (nodePath.isAbsolute(vaultRelativePath))
+      throw new VaultError("'path' must be vault-relative (no leading slash or drive letter)");
+    if (vaultRelativePath.split(/[/\\]/).some(s => s === ".."))
+      throw new VaultError("'path' must not traverse outside the vault (no '..')");
+
+    const base = await this.baseRealPath();
+    const abs = nodePath.resolve(base, vaultRelativePath);
+    if (!this.isInside(base, abs))
+      throw new VaultError(`Path traversal detected: '${vaultRelativePath}' resolves outside the vault`);
+
+    // Walk up to the nearest existing ancestor: a symlink there could redirect
+    // the rest of the path outside the vault.
+    let probe = abs;
+    for (;;) {
+      let stat: fs.Stats | null = null;
+      try { stat = await fs.promises.lstat(probe); } catch { stat = null; }
+      if (stat) break;
+      const parent = nodePath.dirname(probe);
+      if (parent === probe) break;
+      probe = parent;
+    }
+    const realProbe = await fs.promises.realpath(probe).catch(() => probe);
+    if (!this.isInside(base, realProbe))
+      throw new VaultError(`Path traversal detected: '${vaultRelativePath}' escapes the vault through a link`);
+
+    const finalStat = await fs.promises.lstat(abs).catch(() => null);
+    if (finalStat?.isSymbolicLink())
+      throw new VaultError(`Refusing to follow symlink: '${vaultRelativePath}'`);
+
+    return abs;
+  }
+
+  private async statOrNull(abs: string): Promise<fs.Stats | null> {
+    try { return await fs.promises.stat(abs); } catch { return null; }
+  }
+
+  private async readSniff(abs: string): Promise<boolean> {
+    let handle: fs.promises.FileHandle | null = null;
     try {
-      const s = fs.statSync(abs);
-      return { exists: true, isFile: s.isFile(), isDir: s.isDirectory(), size: s.size, mtime: s.mtimeMs };
+      handle = await fs.promises.open(abs, "r");
+      const buffer = Buffer.alloc(SNIFF_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, SNIFF_BYTES, 0);
+      return looksLikeText(buffer.subarray(0, bytesRead));
     } catch {
-      return { exists: false, isFile: false, isDir: false, size: 0, mtime: 0 };
+      return false;
+    } finally {
+      await handle?.close();
     }
   }
 
-  async listFiles(folder = "", extension = "", limit = 2000): Promise<{
-    files: { path: string; name: string; extension: string; size: number; modified: string }[];
-    total: number; shown: number; truncated: boolean; note?: string;
-  }> {
-    const allFiles: { path: string; name: string; extension: string; size: number; modified: string }[] = [];
-    const walkDir = (dirRel: string) => {
-      const abs = this.resolve(dirRel);
-      if (!fs.existsSync(abs)) return;
-      const entries = fs.readdirSync(abs, { withFileTypes: true });
-      for (const entry of entries) {
-        const rel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
+  // ── Directory walk ─────────────────────────────────────────────────────
+  //
+  // Async so the per-tool timeout can fire, bounded by an entry budget, and
+  // never descends into metadata or recycle-bin directories.
+
+  async walk(vaultRelativeFolder = "", budget = this.limits.maxWalkEntries): Promise<WalkResult> {
+    const base = await this.baseRealPath();
+    const root = vaultRelativeFolder ? nodePath.resolve(base, vaultRelativeFolder) : base;
+    if (!this.isInside(base, root))
+      throw new VaultError(`Folder '${vaultRelativeFolder}' is outside the vault`);
+
+    const entries: WalkEntry[] = [];
+    let truncated = false;
+    let ignored = 0;
+
+    const walkDir = async (absDir: string, relDir: string): Promise<void> => {
+      let dirents: fs.Dirent[];
+      try {
+        dirents = await fs.promises.readdir(absDir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      dirents.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of dirents) {
+        if (entries.length >= budget) { truncated = true; return; }
+        const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+        if (isIgnoredPath(rel)) { ignored++; continue; }
+        const abs = nodePath.join(absDir, entry.name);
         if (entry.isDirectory()) {
-          walkDir(rel);
+          await walkDir(abs, rel);
         } else if (entry.isFile()) {
-          const s = fs.statSync(nodePath.join(abs, entry.name));
-          allFiles.push({
-            path: rel,
-            name: entry.name,
-            extension: nodePath.extname(entry.name).slice(1),
-            size: s.size,
-            modified: new Date(s.mtimeMs).toISOString(),
-          });
+          const stat = await this.statOrNull(abs);
+          if (!stat) continue;
+          entries.push({ rel, abs, size: stat.size, mtimeMs: stat.mtimeMs });
+        } else {
+          ignored++; // symlinks, sockets, devices
         }
       }
     };
-    walkDir(folder.replace(/\/$/, ""));
 
-    let filtered = allFiles;
+    await walkDir(root, vaultRelativeFolder.replace(/\/+$/, ""));
+    return { entries, truncated, ignored };
+  }
+
+  // ── list_files ─────────────────────────────────────────────────────────
+
+  async listFiles(folder = "", extension = "", limit = 2000) {
+    const { entries, truncated, ignored } = await this.walk(folder);
+    let filtered = entries;
     if (extension) {
       const ext = extension.replace(/^\./, "").toLowerCase();
-      filtered = filtered.filter(f => f.extension.toLowerCase() === ext);
+      filtered = filtered.filter(f => extensionOf(f.rel).toLowerCase() === ext);
     }
-
     const total = filtered.length;
     const page = filtered.slice(0, limit);
     return {
-      files: page,
+      files: page.map(f => ({
+        path: f.rel,
+        name: nodePath.basename(f.rel),
+        extension: extensionOf(f.rel),
+        size: f.size,
+        modified: new Date(f.mtimeMs).toISOString(),
+      })),
       total,
       shown: page.length,
-      truncated: total > limit,
-      ...(total > limit && { note: `Showing ${limit} of ${total} files. Use folder or extension filters to narrow results.` }),
+      truncated: truncated || total > limit,
+      skipped_metadata: ignored,
+      ...(truncated && {
+        note: `Directory walk stopped after ${this.limits.maxWalkEntries} entries. Narrow the folder filter.`,
+      }),
+      ...(total > limit && {
+        note: `Showing ${limit} of ${total} files. Use folder or extension filters to narrow results.`,
+      }),
     };
   }
+
+  // ── read_file ──────────────────────────────────────────────────────────
 
   async readFile(path: string): Promise<
     | { type: "text"; content: string }
     | { type: "image"; mimeType: string; data: string; note?: string }
     | { type: "binary"; mimeType: string; data: string; size: number }
   > {
-    const abs = this.resolve(path);
-    const st = this.stat(path);
-    if (!st.exists || !st.isFile) throw new Error(`File not found: ${path}`);
+    const abs = await this.resolveSafe(path);
+    const st = await this.statOrNull(abs);
+    if (!st || !st.isFile()) throw new VaultError(`File not found: ${path}`);
 
-    const ext = nodePath.extname(path).slice(1).toLowerCase();
-    const bytes = st.size;
-    const sizeMB = (bytes / 1024 / 1024).toFixed(1);
+    const ext = extensionOf(path);
+    const sizeMB = formatMegabytes(st.size);
+    const cls = classifyExtension(path);
 
-    if (SVG_EXTS.has(ext)) {
-      return { type: "text", content: fs.readFileSync(abs, "utf-8") };
-    }
+    if (cls === "svg") return { type: "text", content: await fs.promises.readFile(abs, "utf-8") };
 
-    if (IMAGE_EXTS.has(ext)) {
-      const mime = mimeType(ext);
-      if (bytes > RESIZE_THRESHOLD) {
-        const maxDim = maxDimForSize(bytes);
+    if (cls === "image") {
+      if (st.size > RESIZE_THRESHOLD) {
+        const maxDim = maxDimForSize(st.size);
         try {
-          const resized = await sharp(abs)
-            .resize(maxDim, maxDim, { fit: "inside" })
-            .jpeg({ quality: 85 })
-            .toBuffer();
-          const note = `[Auto-resized: original ${sizeMB} MB -> ${maxDim}px JPEG 85%]`;
-          return { type: "image", mimeType: "image/jpeg", data: resized.toString("base64"), note };
+          const resized = await sharp(abs).resize(maxDim, maxDim, { fit: "inside" }).jpeg({ quality: 85 }).toBuffer();
+          return {
+            type: "image",
+            mimeType: "image/jpeg",
+            data: resized.toString("base64"),
+            note: `[Auto-resized: original ${sizeMB} -> ${maxDim}px JPEG 85%]`,
+          };
         } catch (err) {
-          throw new Error(
-            `Could not process image (${sizeMB} MB): ` +
-            (err instanceof Error ? err.message : String(err))
-          );
+          throw new VaultError(`Could not process image (${sizeMB}): ` + (err instanceof Error ? err.message : String(err)));
         }
       }
-      const buf = fs.readFileSync(abs);
-      return { type: "image", mimeType: mime, data: buf.toString("base64") };
+      const buf = await fs.promises.readFile(abs);
+      return { type: "image", mimeType: mimeType(ext), data: buf.toString("base64") };
     }
 
-    if (BINARY_EXTS.has(ext)) {
-      if (bytes > MAX_BINARY_BYTES)
-        throw new Error(`File too large to read (${sizeMB} MB, max ${MAX_BINARY_BYTES / 1024 / 1024} MB)`);
-      const buf = fs.readFileSync(abs);
-      return { type: "binary", mimeType: mimeType(ext), data: buf.toString("base64"), size: bytes };
+    const textLike = cls === "text" || (cls === "unknown" && await this.readSniff(abs));
+
+    if (textLike) {
+      if (st.size > this.limits.maxTextReadBytes)
+        throw new VaultError(
+          `Text file too large to read (${sizeMB}, limit ${formatMegabytes(this.limits.maxTextReadBytes)}). ` +
+          "Use run_local_command with grep/awk, or raise VAULT_API_MAX_TEXT_BYTES."
+        );
+      return { type: "text", content: await fs.promises.readFile(abs, "utf-8") };
     }
 
-    try {
-      const content = fs.readFileSync(abs, "utf-8");
-      return { type: "text", content };
-    } catch {
-      const buf = fs.readFileSync(abs);
-      return { type: "binary", mimeType: mimeType(ext), data: buf.toString("base64"), size: bytes };
-    }
+    if (st.size > this.limits.maxBinaryReadBytes)
+      throw new VaultError(
+        `File too large to return as base64 (${sizeMB}, limit ${formatMegabytes(this.limits.maxBinaryReadBytes)}). ` +
+        "Use /raw with a signed URL or run_local_command."
+      );
+    const buf = await fs.promises.readFile(abs);
+    return { type: "binary", mimeType: mimeType(ext), data: buf.toString("base64"), size: st.size };
   }
 
-  async writeFile(path: string, content: string): Promise<{ path: string; action: string }> {
-    const abs = this.resolve(path);
-    const dir = nodePath.dirname(abs);
-    fs.mkdirSync(dir, { recursive: true });
-    const existed = fs.existsSync(abs);
-    fs.writeFileSync(abs, content, "utf-8");
-    return { path, action: existed ? "updated" : "created" };
+  // ── Writers ────────────────────────────────────────────────────────────
+
+  async writeFile(path: string, content: string) {
+    const abs = await this.resolveSafe(path);
+    const st = await this.statOrNull(abs);
+    if (st && !st.isFile()) throw new VaultError(`Not a file: ${path}`);
+    await fs.promises.mkdir(nodePath.dirname(abs), { recursive: true });
+    await fs.promises.writeFile(abs, content, "utf-8");
+    return { path, action: st ? "updated" : "created" };
   }
 
-  async writeBinary(path: string, base64Data: string): Promise<{ path: string; action: string; size: number }> {
+  async writeBinary(path: string, base64Data: string) {
     const approxBytes = Math.ceil(base64Data.length * 3 / 4);
-    if (approxBytes > MAX_BINARY_BYTES)
-      throw new Error(`Data too large to write (~${(approxBytes / 1024 / 1024).toFixed(1)} MB, max ${MAX_BINARY_BYTES / 1024 / 1024} MB)`);
-    const abs = this.resolve(path);
-    const dir = nodePath.dirname(abs);
-    fs.mkdirSync(dir, { recursive: true });
+    if (approxBytes > this.limits.maxBinaryReadBytes)
+      throw new VaultError(
+        `Data too large to write (~${formatMegabytes(approxBytes)}, limit ${formatMegabytes(this.limits.maxBinaryReadBytes)}). ` +
+        "Raise VAULT_API_MAX_BINARY_BYTES if this is intentional."
+      );
+    const abs = await this.resolveSafe(path);
+    await fs.promises.mkdir(nodePath.dirname(abs), { recursive: true });
     const buf = Buffer.from(base64Data, "base64");
-    const existed = fs.existsSync(abs);
-    fs.writeFileSync(abs, buf);
+    const existed = await this.statOrNull(abs);
+    await fs.promises.writeFile(abs, buf);
     return { path, action: existed ? "updated" : "created", size: buf.length };
   }
 
-  async deleteFile(path: string): Promise<{ path: string; action: string }> {
-    const abs = this.resolve(path);
-    if (!fs.existsSync(abs)) throw new Error(`File not found: ${path}`);
-    fs.unlinkSync(abs);
-    return { path, action: "deleted" };
+  /**
+   * Append without rewriting the file. The previous read+write pair could lose
+   * the original content if the NFS mount hiccuped mid-write.
+   */
+  async appendFile(path: string, content: string) {
+    const abs = await this.resolveSafe(path);
+    const st = await this.statOrNull(abs);
+    if (!st || !st.isFile()) throw new VaultError(`File not found: ${path}`);
+    if (st.size + Buffer.byteLength(content) > this.limits.maxTextReadBytes)
+      throw new VaultError(
+        `Append would exceed the text size limit (${formatMegabytes(st.size + Buffer.byteLength(content))} > ` +
+        `${formatMegabytes(this.limits.maxTextReadBytes)}).`
+      );
+    await fs.promises.appendFile(abs, content, "utf-8");
+    return { path, action: "appended", totalSize: st.size + Buffer.byteLength(content) };
   }
 
-  async readFrontmatter(path: string): Promise<{ path: string; hasFrontmatter: boolean; frontmatter: Record<string, unknown>; raw: string | null }> {
-    const abs = this.resolve(path);
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`File not found: ${path}`);
-    const content = fs.readFileSync(abs, "utf-8");
-    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!fmMatch) return { path, hasFrontmatter: false, frontmatter: {}, raw: null };
-    const raw = fmMatch[1];
-    const frontmatter: Record<string, unknown> = {};
-    for (const line of raw.split("\n")) {
-      const m = line.match(/^(\w[\w\s]*?):\s*(.+)/);
-      if (m) frontmatter[m[1].trim()] = m[2].trim();
+  // ── Deletion (trash by default) ────────────────────────────────────────
+  //
+  // Permanent deletion is never the default: an agent mistake should be
+  // recoverable, matching the desktop plugin's system-trash behaviour.
+
+  private trashDir(): string {
+    const raw = process.env.VAULT_API_TRASH_DIR;
+    return raw === undefined ? ".trash" : raw.trim();
+  }
+
+  private async uniqueTrashTarget(rel: string): Promise<string> {
+    const trash = this.trashDir();
+    let candidate = `${trash}/${rel}`;
+    for (let i = 1; i < 1000; i++) {
+      try {
+        await fs.promises.lstat(await this.resolveSafe(candidate));
+      } catch {
+        return candidate;
+      }
+      const ext = nodePath.extname(rel);
+      candidate = `${trash}/${rel.slice(0, rel.length - ext.length)}-${i}${ext}`;
     }
-    return { path, hasFrontmatter: true, frontmatter, raw };
+    throw new VaultError(`Could not find a free trash name for '${rel}'`);
   }
 
-  async updateFrontmatter(path: string, updates: Record<string, string | null>): Promise<{ path: string; action: string }> {
-    const abs = this.resolve(path);
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`File not found: ${path}`);
-    let content = fs.readFileSync(abs, "utf-8");
-    const fmMatch = content.match(/^---\n[\s\S]*?\n---\n*/);
-    if (fmMatch) {
-      const fmRaw = fmMatch[0];
-      const bodyStart = fmRaw.length;
-      const existing: Record<string, string> = {};
-      for (const line of fmRaw.split("\n")) {
-        const m = line.match(/^(\w[\w\s]*?):\s*(.+)/);
-        if (m) existing[m[1].trim()] = m[2].trim();
-      }
-      for (const [key, val] of Object.entries(updates)) {
-        if (val === null) delete existing[key];
-        else existing[key] = val;
-      }
-      const newFm = "---\n" + Object.entries(existing).map(([k, v]) => `${k}: ${v}`).join("\n") + "\n---\n";
-      content = newFm + content.slice(bodyStart).replace(/^---\n[\s\S]*?\n---\n*/, "");
-    } else {
-      const fmLines = Object.entries(updates)
-        .filter(([, val]) => val !== null)
-        .map(([k, v]) => `${k}: ${v}`);
-      if (fmLines.length > 0) {
-        content = "---\n" + fmLines.join("\n") + "\n---\n" + content;
-      }
+  private async moveToTrash(abs: string, rel: string): Promise<string | null> {
+    const trash = this.trashDir();
+    if (trash === "") {
+      await fs.promises.rm(abs, { recursive: true, force: true });
+      return null;
     }
-    fs.writeFileSync(abs, content, "utf-8");
-    return { path, action: "frontmatter_updated" };
+    const targetRel = await this.uniqueTrashTarget(rel);
+    const targetAbs = await this.resolveSafe(targetRel);
+    await fs.promises.mkdir(nodePath.dirname(targetAbs), { recursive: true });
+    await fs.promises.rename(abs, targetAbs);
+    return targetRel;
   }
 
-  async createFolder(path: string): Promise<{ path: string; action: string }> {
-    const abs = this.resolve(path);
-    if (fs.existsSync(abs)) return { path, action: "already_exists" };
-    fs.mkdirSync(abs, { recursive: true });
+  private async located(path: string): Promise<{ abs: string; rel: string; stat: fs.Stats }> {
+    const abs = await this.resolveSafe(path);
+    const rel = nodePath.relative(await this.baseRealPath(), abs);
+    const stat = await this.statOrNull(abs);
+    if (!stat) throw new VaultError(`Not found: ${path}`);
+    return { abs, rel, stat };
+  }
+
+  async deleteFile(path: string) {
+    const { abs, rel, stat } = await this.located(path);
+    if (!stat.isFile()) throw new VaultError(`File not found: ${path}`);
+    const trashPath = await this.moveToTrash(abs, rel);
+    return { path, action: trashPath ? "moved_to_trash" : "deleted", ...(trashPath ? { trashPath } : {}) };
+  }
+
+  async deleteFolder(path: string) {
+    const { abs, rel, stat } = await this.located(path);
+    if (!stat.isDirectory()) throw new VaultError(`Folder not found: ${path}`);
+    const trashPath = await this.moveToTrash(abs, rel);
+    return { path, action: trashPath ? "moved_to_trash" : "folder_deleted", ...(trashPath ? { trashPath } : {}) };
+  }
+
+  async createFolder(path: string) {
+    const abs = await this.resolveSafe(path);
+    const st = await this.statOrNull(abs);
+    if (st) return { path, action: "already_exists" };
+    await fs.promises.mkdir(abs, { recursive: true });
     return { path, action: "folder_created" };
   }
 
-  async deleteFolder(path: string): Promise<{ path: string; action: string }> {
-    const abs = this.resolve(path);
-    if (!fs.existsSync(abs)) throw new Error(`Folder not found: ${path}`);
-    fs.rmSync(abs, { recursive: true });
-    return { path, action: "folder_deleted" };
-  }
-
-  async renameFolder(path: string, newPath: string): Promise<{ path: string; newPath: string; action: string }> {
-    const abs = this.resolve(path);
-    const newAbs = this.resolve(newPath);
-    if (!fs.existsSync(abs)) throw new Error(`Folder not found: ${path}`);
-    const dir = nodePath.dirname(newAbs);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.renameSync(abs, newAbs);
+  async renameFolder(path: string, newPath: string) {
+    const abs = await this.resolveSafe(path);
+    const newAbs = await this.resolveSafe(newPath);
+    const st = await this.statOrNull(abs);
+    if (!st) throw new VaultError(`Folder not found: ${path}`);
+    if (this.isInside(await this.baseRealPath(), newAbs) === false)
+      throw new VaultError(`Destination '${newPath}' is outside the vault`);
+    if (newAbs === abs) throw new VaultError("Source and destination are the same path");
+    if (newAbs.startsWith(abs + nodePath.sep))
+      throw new VaultError("Cannot move a folder inside itself");
+    await fs.promises.mkdir(nodePath.dirname(newAbs), { recursive: true });
+    await fs.promises.rename(abs, newAbs);
     return { path, newPath, action: "folder_renamed" };
   }
 
-  async appendFile(path: string, content: string): Promise<{ path: string; action: string; totalSize: number }> {
-    const abs = this.resolve(path);
-    if (!fs.existsSync(abs)) throw new Error(`File not found: ${path}`);
-    const existing = fs.readFileSync(abs, "utf-8");
-    fs.writeFileSync(abs, existing + content, "utf-8");
-    return { path, action: "appended", totalSize: existing.length + content.length };
+  // ── Frontmatter ────────────────────────────────────────────────────────
+
+  async readFrontmatter(path: string) {
+    const abs = await this.resolveSafe(path);
+    const st = await this.statOrNull(abs);
+    if (!st || !st.isFile()) throw new VaultError(`File not found: ${path}`);
+    if (st.size > this.limits.maxTextReadBytes)
+      throw new VaultError(`File too large to read frontmatter (${formatMegabytes(st.size)}).`);
+    const content = await fs.promises.readFile(abs, "utf-8");
+    const block = splitFrontmatter(content);
+    if (!block || block.lines.length === 0)
+      return { path, hasFrontmatter: false, frontmatter: {}, raw: null };
+    return {
+      path,
+      hasFrontmatter: true,
+      frontmatter: parseFrontmatterValues(block.lines),
+      raw: block.lines.join(block.eol),
+    };
   }
 
-  async search(query: string): Promise<{
-    results: { path: string; matches: string[] }[];
-    results_shown: number;
-    capped: boolean;
-    note?: string;
-  }> {
-    const q = query.toLowerCase();
-    const results: { path: string; matches: string[] }[] = [];
-    const MAX_RESULTS = 50;
-    const allFiles: { rel: string; abs: string; ext: string }[] = [];
+  async updateFrontmatter(path: string, updates: Record<string, string | null>) {
+    const abs = await this.resolveSafe(path);
+    const st = await this.statOrNull(abs);
+    if (!st || !st.isFile()) throw new VaultError(`File not found: ${path}`);
+    if (st.size > this.limits.maxTextReadBytes)
+      throw new VaultError(`File too large to edit frontmatter (${formatMegabytes(st.size)}).`);
+    const content = await fs.promises.readFile(abs, "utf-8");
+    let block = splitFrontmatter(content);
+    if (!block) {
+      const eol = content.includes("\r\n") ? "\r\n" : "\n";
+      block = { prefix: "", lines: [], body: content.slice(content.charCodeAt(0) === 0xfeff ? 1 : 0), eol };
+    }
+    const nextLines = applyFrontmatterUpdates(block, updates);
+    const rendered = renderFrontmatter(block, nextLines);
+    const tmp = `${abs}.tmp-${process.pid}-${Date.now()}`;
+    await fs.promises.writeFile(tmp, rendered, "utf-8");
+    await fs.promises.rename(tmp, abs); // atomic on the same filesystem
+    return { path, action: "frontmatter_updated" };
+  }
 
-    const walkDir = (dirAbs: string, dirRel: string) => {
-      const entries = fs.readdirSync(dirAbs, { withFileTypes: true });
-      for (const entry of entries) {
-        const rel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          walkDir(nodePath.join(dirAbs, entry.name), rel);
-        } else if (entry.isFile()) {
-          const ext = nodePath.extname(entry.name).slice(1).toLowerCase();
-          allFiles.push({ rel, abs: nodePath.join(dirAbs, entry.name), ext });
+  // ── search ─────────────────────────────────────────────────────────────
+  //
+  // The previous version opened every file that was not on a short binary
+  // extension list, with readFileSync and no size check. In a vault that also
+  // holds course media that meant a 4.8 GB .iso being decoded as UTF-8, which
+  // OOM-kills the container. Everything here is streamed and budgeted.
+
+  private async scanFile(
+    file: WalkEntry,
+    needle: string,
+    deadlineAt: number,
+    byteBudget: number
+  ): Promise<{ matches: string[]; bytes: number }> {
+    const cls = classifyExtension(file.rel);
+    if (cls === "unknown" && !await this.readSniff(file.abs)) return { matches: [], bytes: 0 };
+
+    const matches: string[] = [];
+    let bytes = 0;
+    const stream = fs.createReadStream(file.abs, { encoding: "utf-8" });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+      for await (const line of rl) {
+        bytes += Buffer.byteLength(line) + 1;
+        if (bytes > byteBudget) break;
+        if (line.toLowerCase().includes(needle)) {
+          matches.push(line.trim().slice(0, 500));
+          if (matches.length >= 3) break;
         }
+        if (Date.now() >= deadlineAt) break;
       }
-    };
-    walkDir(this.vaultBase, "");
+    } catch {
+      // Unreadable or mid-read mount error: skip the file, keep the results.
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+    return { matches, bytes };
+  }
 
-    for (const file of allFiles) {
+  async search(query: string, options: { deadlineAt?: number; maxResults?: number } = {}) {
+    const MAX_RESULTS = options.maxResults ?? 50;
+    const deadline = options.deadlineAt ?? Date.now() + 20_000;
+    const needle = query.toLowerCase();
+
+    const { entries, truncated: walkTruncated, ignored } = await this.walk("");
+
+    const results: { path: string; matches: string[] }[] = [];
+    for (const entry of entries) {
       if (results.length >= MAX_RESULTS) break;
-      if (file.rel.toLowerCase().includes(q))
-        results.push({ path: file.rel, matches: ["(filename match)"] });
+      if (entry.rel.toLowerCase().includes(needle))
+        results.push({ path: entry.rel, matches: ["(filename match)"] });
     }
 
     const matched = new Set(results.map(r => r.path));
-    const textFiles = allFiles.filter(f => {
-      return !BINARY_EXTS.has(f.ext) && !IMAGE_EXTS.has(f.ext) && !matched.has(f.rel);
-    });
-
-    const BATCH = 20;
-    for (let i = 0; i < textFiles.length && results.length < MAX_RESULTS; i += BATCH) {
-      const batch = textFiles.slice(i, i + BATCH);
-      const batchResults = await Promise.all(batch.map(async (file): Promise<{ path: string; matches: string[] } | null> => {
-        try {
-          const text = fs.readFileSync(file.abs, "utf-8");
-          const lines = text.split("\n").filter(l => l.toLowerCase().includes(q));
-          if (lines.length)
-            return { path: file.rel, matches: lines.slice(0, 3).map(l => l.trim()) };
-        } catch { /* skip unreadable */ }
-        return null;
-      }));
-      for (const r of batchResults) {
-        if (r && results.length < MAX_RESULTS) results.push(r);
-      }
+    let skippedTooLarge = 0;
+    let skippedBinary = 0;
+    const candidates: WalkEntry[] = [];
+    for (const entry of entries) {
+      if (matched.has(entry.rel)) continue;
+      const decision = shouldScanContent(entry.rel, entry.size, this.limits);
+      if (decision.scan) candidates.push(entry);
+      else if (decision.reason === "too_large") skippedTooLarge++;
+      else if (decision.reason === "binary") skippedBinary++;
     }
+
+    let bytesScanned = 0;
+    let filesScanned = 0;
+    let deadlineHit = false;
+    let budgetHit = false;
+
+    for (const file of candidates) {
+      if (results.length >= MAX_RESULTS) break;
+      if (Date.now() >= deadline) { deadlineHit = true; break; }
+      if (bytesScanned >= this.limits.maxScanTotalBytes) { budgetHit = true; break; }
+      const { matches, bytes } = await this.scanFile(file, needle, deadline, this.limits.maxScanTotalBytes - bytesScanned);
+      filesScanned++;
+      bytesScanned += bytes;
+      if (matches.length) results.push({ path: file.rel, matches });
+    }
+
+    const capped = results.length >= MAX_RESULTS;
+    const partial = capped || deadlineHit || budgetHit || walkTruncated;
+    const notes: string[] = [];
+    if (capped) notes.push(`Results capped at ${MAX_RESULTS}. Refine your query to see more specific matches.`);
+    if (deadlineHit) notes.push("Search stopped at the time budget; results are partial, not empty.");
+    if (budgetHit) notes.push(`Search stopped after reading ${formatMegabytes(this.limits.maxScanTotalBytes)}; results are partial.`);
+    if (walkTruncated) notes.push(`Directory walk stopped after ${this.limits.maxWalkEntries} entries; results are partial.`);
+    if (skippedTooLarge) notes.push(`${skippedTooLarge} file(s) over ${formatMegabytes(this.limits.maxScanFileBytes)} were not opened.`);
 
     return {
       results,
       results_shown: results.length,
-      capped: results.length >= MAX_RESULTS,
-      note: results.length >= MAX_RESULTS
-        ? `Results capped at ${MAX_RESULTS}. Refine your query to see more specific matches.`
-        : undefined,
+      capped,
+      partial,
+      scanned_files: filesScanned,
+      bytes_scanned: bytesScanned,
+      skipped: { ignored_metadata: ignored, too_large: skippedTooLarge, binary: skippedBinary },
+      ...(notes.length ? { note: notes.join(" ") } : {}),
     };
   }
 }
