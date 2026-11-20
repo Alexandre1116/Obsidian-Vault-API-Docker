@@ -32,6 +32,8 @@
   key in a URL.
 - Path handling rejects NUL bytes and refuses symlinks that resolve outside the
   vault.
+- CI runs the suite on Linux and Windows; the `0600` config-file assertion is
+  skipped on Windows because the mode is a no-op there.
 
 ### Behaviour changes
 - `delete_file` and `delete_folder` move content to `.trash/` inside the vault

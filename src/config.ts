@@ -52,7 +52,8 @@ export class ConfigManager {
   save(): void {
     const dir = nodePath.dirname(this.configPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    // The file holds the API key, so it must not be world readable.
+    // The file holds the API key, so it must not be world readable. On Windows
+    // the mode is a no-op and the file inherits its NTFS ACL.
     fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), { encoding: "utf-8", mode: 0o600 });
     try { fs.chmodSync(this.configPath, 0o600); } catch { /* non-POSIX filesystem */ }
   }

@@ -7,22 +7,24 @@ import {
   formatValue,
 } from "../src/vault-frontmatter.js";
 
+// Fixture deliberately mixes a comment, a nested mapping, a list, an inline
+// array, a quoted wikilink and a body line that contains a colon.
 const NOTE = [
   "---",
-  "title: Nota de aula",
-  "# comentário do autor",
-  "tags: [aula, matematica]",
-  "autor:",
-  "  nome: Ana",
-  "  curso: ICRDC",
+  "title: Lecture note",
+  "# author comment",
+  "tags: [lecture, maths]",
+  "author:",
+  "  name: Ana",
+  "  course: ICRDC",
   "links:",
-  "  - \"[[Aula 1]]\"",
-  "  - \"[[Aula 2]]\"",
-  "data: 2026-11-18",
+  "  - \"[[Lecture 1]]\"",
+  "  - \"[[Lecture 2]]\"",
+  "date: 2026-11-18",
   "---",
   "",
-  "# Corpo",
-  "texto: com dois pontos",
+  "# Body",
+  "some text: with a colon",
 ].join("\n");
 
 function block(content: string) {
@@ -34,42 +36,48 @@ function block(content: string) {
 describe("frontmatter editing", () => {
   it("finds the block and parses values", () => {
     const parsed = parseFrontmatterValues(block(NOTE).lines);
-    expect(parsed.title).toBe("Nota de aula");
-    expect(parsed.tags).toBe("[aula, matematica]");
-    expect(parsed.autor).toEqual(["nome: Ana", "curso: ICRDC"]);
-    expect(parsed.data).toBe("2026-11-18");
+    expect(parsed.title).toBe("Lecture note");
+    expect(parsed.tags).toBe("[lecture, maths]");
+    expect(parsed.author).toEqual(["name: Ana", "course: ICRDC"]);
+    expect(parsed.date).toBe("2026-11-18");
   });
 
   it("updates one key and leaves comments and nesting untouched", () => {
     const b = block(NOTE);
-    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { title: "Título novo" }));
-    expect(out).toContain("title: Título novo");
-    expect(out).toContain("# comentário do autor");
-    expect(out).toContain("  nome: Ana");
-    expect(out).toContain("  - \"[[Aula 2]]\"");
-    expect(out).toContain("texto: com dois pontos");
+    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { title: "New title" }));
+    expect(out).toContain("title: New title");
+    expect(out).toContain("# author comment");
+    expect(out).toContain("  name: Ana");
+    expect(out).toContain("  - \"[[Lecture 2]]\"");
+    expect(out).toContain("some text: with a colon");
     expect(out.split("\n").filter(l => l.startsWith("title:"))).toHaveLength(1);
   });
 
   it("removes a key together with its nested lines", () => {
     const b = block(NOTE);
-    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { autor: null }));
-    expect(out).not.toContain("nome: Ana");
-    expect(out).not.toContain("curso: ICRDC");
-    expect(out).toContain("tags: [aula, matematica]");
-    expect(out).toContain("  - \"[[Aula 1]]\"");
+    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { author: null }));
+    expect(out).not.toContain("name: Ana");
+    expect(out).not.toContain("course: ICRDC");
+    expect(out).toContain("tags: [lecture, maths]");
+    expect(out).toContain("  - \"[[Lecture 1]]\"");
   });
 
   it("quotes values that would break YAML", () => {
     const b = block(NOTE);
-    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { title: "a: b", extra: "sim" }));
+    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { title: "a: b", extra: "yes" }));
     expect(out).toContain('title: "a: b"');
-    expect(out).toContain("extra: sim");
+    expect(out).toContain("extra: yes");
     expect(formatValue("2026-11-18")).toBe('"2026-11-18"');
   });
 
+  it("keeps non-ASCII values byte for byte", () => {
+    const b = block(NOTE);
+    const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { title: "Café résumé naïve" }));
+    expect(out).toContain("title: Café résumé naïve");
+  });
+
   it("creates a block for files without one", () => {
-    const parsed = splitFrontmatter("# só corpo\n");
+    const parsed = splitFrontmatter("# body only\n");
     expect(parsed).toBeNull();
   });
 
@@ -78,6 +86,6 @@ describe("frontmatter editing", () => {
     const b = block(crlf);
     const out = renderFrontmatter(b, applyFrontmatterUpdates(b, { title: "X" }));
     expect(out.split("\r\n").length).toBeGreaterThan(1);
-    expect(out).not.toMatch(/(^|[^\r])\n# Corpo/);
+    expect(out).not.toMatch(/(^|[^\r])\n# Body/);
   });
 });

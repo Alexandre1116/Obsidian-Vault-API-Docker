@@ -27,7 +27,7 @@ describe("metadata and media filtering", () => {
     expect(bigMd.scan).toBe(false);
     expect(bigMd.reason).toBe("too_large");
 
-    const slides = shouldScanContent("deck.apresentacao.oslides", 34 * 1024 * 1024, DEFAULT_SCAN_LIMITS);
+    const slides = shouldScanContent("deck.presentation.oslides", 34 * 1024 * 1024, DEFAULT_SCAN_LIMITS);
     expect(slides.scan).toBe(false);
 
     expect(shouldScanContent("notes/ok.md", 1024, DEFAULT_SCAN_LIMITS).scan).toBe(true);
@@ -45,7 +45,8 @@ describe("metadata and media filtering", () => {
   });
 
   it("sniffs text versus binary", () => {
-    expect(looksLikeText(Buffer.from("# Título\nlinha com acentuação\n", "utf-8"))).toBe(true);
+    // Non-ASCII on purpose: high UTF-8 bytes must still count as text.
+    expect(looksLikeText(Buffer.from("# Title\nline with accents: café naïve\n", "utf-8"))).toBe(true);
     expect(looksLikeText(Buffer.from([0x00, 0x01, 0x02, 0x4d, 0x5a]))).toBe(false);
   });
 });

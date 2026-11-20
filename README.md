@@ -82,7 +82,7 @@ The dashboard page itself contains no secret: the server never sends the API key
 ## Security notes
 
 - The API key grants file access and shell access. Treat it like a password: keep it in `.env` (`chmod 600 .env`), never in the compose file, and rotate it from the dashboard if it leaks.
-- The key is not printed in logs, not returned by `GET /api/config`, and `/data/config.json` is saved with mode `0600`.
+- The key is not printed in logs, not returned by `GET /api/config`, and `/data/config.json` is saved with mode `0600` (on Windows the file inherits its NTFS ACL instead).
 - Image results give a short-lived signed `/raw` URL (`token=`, 15 minutes) instead of embedding the key, so the credential never enters the model context.
 - `VAULT_API_ALLOWED_COMMANDS` defaults to `*` for compatibility. Prefer an explicit allowlist; `run_local_command` runs inside the container with the vault mounted.
 - Bind to a trusted interface (`VAULT_API_BIND`), or restrict the port with your firewall. The container drops all capabilities, is read-only and cannot escalate privileges in the shipped compose file.

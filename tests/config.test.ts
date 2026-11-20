@@ -9,11 +9,21 @@ let dataDir = "";
 beforeEach(() => { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-config-")); });
 afterEach(() => { fs.rmSync(dataDir, { recursive: true, force: true }); });
 
+// Node reports a fixed 0o666 for every file on Windows: the mode option and
+// chmod are no-ops there because access is controlled by NTFS ACLs. The
+// permission assertion is therefore only meaningful on POSIX systems.
+const POSIX = process.platform !== "win32";
+
 describe("config storage", () => {
-  it("writes the key file so only the owner can read it", () => {
+  it("writes a usable key file on every platform", () => {
     const mgr = new ConfigManager(dataDir);
     const key = mgr.get().apiKey;
     expect(key.length).toBeGreaterThanOrEqual(48);
+    expect(fs.readFileSync(path.join(dataDir, "config.json"), "utf-8")).toContain(key);
+  });
+
+  it.runIf(POSIX)("saves the key file so only the owner can read it", () => {
+    new ConfigManager(dataDir);
     const mode = fs.statSync(path.join(dataDir, "config.json")).mode & 0o777;
     expect(mode).toBe(0o600);
   });
