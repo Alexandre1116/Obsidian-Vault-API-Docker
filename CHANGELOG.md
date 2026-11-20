@@ -32,6 +32,15 @@
   key in a URL.
 - Path handling rejects NUL bytes and refuses symlinks that resolve outside the
   vault.
+- `read_file` checks the text size limit before opening an SVG and re-checks the
+  decoded length, so an embedded-image SVG can no longer allocate unbounded
+  memory. The same shared check now covers every text path.
+- `run_local_command` no longer lets an allowlisted program run a second one.
+  With an allowlist configured, shell operators (`;`, `&&`, `||`, `|`, `&`,
+  backticks, `$(`, `<(`, `>(`, `<`, `>`, newlines) are rejected, arguments must
+  stay inside the vault directory, and self-executing flags (`-exec`, `-execdir`,
+  `-delete`, `-ok`) are rejected. `VAULT_API_ALLOWED_COMMANDS=*` still means no
+  confinement and is unchanged.
 - CI runs the suite on Linux and Windows; the `0600` config-file assertion is
   skipped on Windows because the mode is a no-op there.
 

@@ -34,7 +34,7 @@ services:
       - /path/to/your/vault:/vault
       - vault-api-data:/data
     environment:
-      - VAULT_API_ALLOWED_COMMANDS=pdftotext,pandoc,git,ls,find,grep,stat
+      - VAULT_API_ALLOWED_COMMANDS=ls,stat,grep,wc,head,tail,pdftotext
     env_file:
       - .env
     mem_limit: 512m
@@ -84,7 +84,7 @@ The dashboard page itself contains no secret: the server never sends the API key
 - The API key grants file access and shell access. Treat it like a password: keep it in `.env` (`chmod 600 .env`), never in the compose file, and rotate it from the dashboard if it leaks.
 - The key is not printed in logs, not returned by `GET /api/config`, and `/data/config.json` is saved with mode `0600` (on Windows the file inherits its NTFS ACL instead).
 - Image results give a short-lived signed `/raw` URL (`token=`, 15 minutes) instead of embedding the key, so the credential never enters the model context.
-- `VAULT_API_ALLOWED_COMMANDS` defaults to `*` for compatibility. Prefer an explicit allowlist; `run_local_command` runs inside the container with the vault mounted.
+- `VAULT_API_ALLOWED_COMMANDS` defaults to `*` for compatibility, which means **no confinement**: any program, and `bash -c` itself. As soon as you list programs, the list is enforced honestly — shell operators (`;`, `&&`, `||`, `|`, `&`, backticks, `$(`, `<(`, `>(`, `<`, `>`, newlines) are rejected, arguments must stay inside the vault directory (no absolute paths, `~`, or `..`), and flags that execute or delete by themselves (`-exec`, `-execdir`, `-delete`, `-ok`) are rejected. A bare name still allows any arguments, so list the smallest set of read-only helpers, or pin the invocation shape with a whole-command glob such as `pdftotext *.pdf`. An allowlisted program keeps its own power (`grep -f`, `pandoc --lua-filter`), so do not list programs that can run code.
 - Bind to a trusted interface (`VAULT_API_BIND`), or restrict the port with your firewall. The container drops all capabilities, is read-only and cannot escalate privileges in the shipped compose file.
 - `delete_file` and `delete_folder` move content to `.trash/` inside the vault. Set `VAULT_API_TRASH_DIR=` (empty) for permanent deletion.
 

@@ -10,6 +10,7 @@ import { VaultTools } from "./vault-tools.js";
 import { getDashboardHtml } from "./web-ui.js";
 import { publicConfig, type Config } from "./config.js";
 import { signRawToken, verifyRawToken } from "./vault-policy.js";
+import { isCommandAllowed } from "./command-policy.js";
 import { APP_VERSION } from "./version.js";
 import type { UpdateResult, UpdateStatus } from "./updater.js";
 
@@ -23,28 +24,6 @@ const MAX_QUERY_LEN = 500;
 const MAX_CMD_BUFFER = 10 * 1024 * 1024;
 const TOOL_TIMEOUT_MS = 25_000;
 const COMMAND_TIMEOUT_MS = 25_000;
-
-function globMatch(pattern: string, cmd: string): boolean {
-  if (pattern === "*") return true;
-  const regexStr = "^" + pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, ".*")
-    .replace(/\?/g, ".")
-    + "$";
-  return new RegExp(regexStr, "i").test(cmd.trim());
-}
-
-function isCommandAllowed(cmd: string, patterns: string): string | null {
-  if (!patterns || patterns === "*") return null;
-  const cmds = cmd.trim().split(/\s+/);
-  const firstToken = cmds[0] || "";
-  for (const pattern of patterns.split(",")) {
-    const p = pattern.trim();
-    if (!p) continue;
-    if (globMatch(p, cmd.trim()) || globMatch(p, firstToken)) return null;
-  }
-  return `Command '${firstToken}' is not in the allowed list. Allowed patterns: ${patterns}`;
-}
 
 function validatePath(p: unknown): string {
   if (typeof p !== "string" || p.length === 0)
@@ -436,7 +415,7 @@ export class VaultMcpServer {
             console.log(`[vault-api] run_local_command: ${cmd.slice(0, 200)}`);
 
             return new Promise((resolve) => {
-              exec(cmd, { cwd: this.vaultBase, maxBuffer: MAX_CMD_BUFFER, timeout: 25_000 }, (error, stdout, stderr) => {
+              exec(cmd, { cwd: this.vaultBase, maxBuffer: MAX_CMD_BUFFER, timeout: COMMAND_TIMEOUT_MS }, (error, stdout, stderr) => {
                 let text = "";
                 if (stdout) text += `--- STDOUT ---\n${stdout}\n`;
                 if (stderr) text += `--- STDERR ---\n${stderr}\n`;
