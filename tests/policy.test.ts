@@ -7,6 +7,8 @@ import {
   classifyExtension,
   signRawToken,
   verifyRawToken,
+  validateBase64Payload,
+  formatMegabytes,
 } from "../src/vault-policy.js";
 
 describe("metadata and media filtering", () => {
@@ -69,5 +71,40 @@ describe("signed /raw tokens", () => {
     expect(verifyRawToken(key, "notes/img.png", `9999999999.${sig}`)).toBe(false);
     expect(verifyRawToken(key, "notes/img.png", null)).toBe(false);
     expect(verifyRawToken("", "notes/img.png", token)).toBe(false);
+  });
+});
+
+describe("validateBase64Payload", () => {
+  const LIMIT = 64;
+
+  it("accepts a well-formed payload and reports the decoded size", () => {
+    const payload = Buffer.from("hello vault").toString("base64");
+    expect(validateBase64Payload(payload, LIMIT)).toEqual({ ok: true, estimatedBytes: 11 });
+    expect(Buffer.from(payload, "base64").length).toBe(11);
+  });
+
+  it("rejects whitespace, which Buffer.from would quietly ignore", () => {
+    const payload = Buffer.from("hello vault").toString("base64");
+    expect(validateBase64Payload(payload.slice(0, 4) + "\n" + payload.slice(4), LIMIT).ok).toBe(false);
+  });
+
+  it("rejects a non-alphabet string, bad padding and a bad length", () => {
+    for (const bad of ["!!!!", "a===", "abc", "a".repeat(10) + "_" + "a".repeat(13)]) {
+      expect(validateBase64Payload(bad, LIMIT).ok, bad).toBe(false);
+    }
+  });
+
+  it("rejects an oversized payload before it is decoded", () => {
+    const check = validateBase64Payload(Buffer.alloc(LIMIT + 2, 0x41).toString("base64"), LIMIT);
+    expect(check.ok).toBe(false);
+    if (!check.ok) expect(check.reason).toMatch(/too large .*limit 64 B|too large/);
+  });
+});
+
+describe("formatMegabytes", () => {
+  it("uses KB for sub-megabyte limits and MB above them", () => {
+    expect(formatMegabytes(64 * 1024)).toBe("64 KB");
+    expect(formatMegabytes(256 * 1024)).toBe("256 KB");
+    expect(formatMegabytes(4 * 1024 * 1024)).toBe("4.0 MB");
   });
 });

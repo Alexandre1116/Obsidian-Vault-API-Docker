@@ -176,3 +176,71 @@ describe("frontmatter through the tool surface", () => {
     expect(res.hasFrontmatter).toBe(false);
   });
 });
+
+describe("bounded reads take their size from the open handle", () => {
+  it("reassembles a file that spans several chunks", async () => {
+    const roomy = new VaultTools(root, { ...LIMITS, maxTextReadBytes: 512 * 1024 });
+    const body = Buffer.alloc(200 * 1024);
+    for (let i = 0; i < body.length; i++) body[i] = 0x61 + (i % 26);
+    write("notes/long.md", body);
+    const read = await roomy.readFile("notes/long.md");
+    expect(read.type).toBe("text");
+    expect(Buffer.from(read.content ?? "", "utf-8").equals(body)).toBe(true);
+  });
+
+  it("reports the size on disk, not the size the caller saw, when a file grew", async () => {
+    // The file was small when it was created; a sync client (or this test) grew
+    // it afterwards. The cap has to be enforced against what is on disk now.
+    write("notes/grew.md", "small\n");
+    fs.writeFileSync(path.join(root, "notes/grew.md"), Buffer.alloc(3 * 1024 * 1024, 0x67));
+    const err = await tools.readFile("notes/grew.md").catch(e => String(e.message));
+    expect(err).toMatch(/too large to read \(3\.0 MB, limit 64 KB\)/);
+  });
+
+  it("never allocates more than the cap for an oversized file", async () => {
+    write("notes/million.md", Buffer.alloc(8 * 1024 * 1024, 0x6d));
+    const before = process.memoryUsage().rss;
+    await expect(tools.readFile("notes/million.md")).rejects.toThrow(/too large to read/);
+    // Reading 8 MB of text would have shown up as a jump of that order.
+    expect(process.memoryUsage().rss - before).toBeLessThan(2 * 1024 * 1024);
+  });
+
+  it("refuses a binary above the base64 cap using the current size", async () => {
+    write("media/grew.bin", Buffer.alloc(8 * 1024, 0x41));
+    fs.writeFileSync(path.join(root, "media/grew.bin"), Buffer.alloc(600 * 1024, 0x42));
+    const err = await tools.readFile("media/grew.bin").catch(e => String(e.message));
+    expect(err).toMatch(/too large to return as base64 \(600 KB, limit 256 KB\)/);
+  });
+});
+
+describe("write_binary validates the payload before decoding it", () => {
+  const valid = Buffer.from("binary payload\n").toString("base64");
+
+  it("accepts a well-formed payload and writes exactly those bytes", async () => {
+    const r = await tools.writeBinary("media/ok.bin", valid);
+    expect(r.size).toBe(15);
+    expect(fs.readFileSync(path.join(root, "media/ok.bin")).toString()).toBe("binary payload\n");
+  });
+
+  it("rejects malformed payloads without writing anything", () => {
+    const bad: [string, string][] = [
+      ["whitespace inside", valid.slice(0, 8) + "\n" + valid.slice(8)],
+      ["characters outside the alphabet", "!!!!" + valid],
+      ["bad padding", valid.slice(0, valid.length - 2) + "="],
+      ["length not a multiple of four", "abc"],
+      ["empty body", ""],
+    ];
+    for (const [name, payload] of bad) {
+      const abs = path.join(root, "media/bad.bin");
+      const call = tools.writeBinary("media/bad.bin", payload);
+      expect(call, name).rejects.toThrow(/cannot be written/);
+      expect(fs.existsSync(abs), name).toBe(false);
+    }
+  });
+
+  it("rejects an oversized payload before decoding it", async () => {
+    const huge = Buffer.alloc(400 * 1024, 0x41).toString("base64");
+    await expect(tools.writeBinary("media/huge.bin", huge)).rejects.toThrow(/too large .*decoded, limit 256 KB/);
+    expect(fs.existsSync(path.join(root, "media/huge.bin"))).toBe(false);
+  });
+});

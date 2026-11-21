@@ -10,6 +10,7 @@ import {
   limitsFromEnv,
   looksLikeText,
   shouldScanContent,
+  validateBase64Payload,
   type ScanLimits,
 } from "./vault-policy.js";
 import {
@@ -207,25 +208,53 @@ export class VaultTools {
   // ── read_file ──────────────────────────────────────────────────────────
 
   /**
-   * Reads a file as UTF-8 text with the size checked both before opening it and
-   * after decoding. The second check matters: an SVG with embedded base64
-   * images, or a file whose size changed since the listing, can decode far
-   * above the limit and allocate anyway.
+   * Reads at most `capBytes` from an open handle, in chunks. Nothing is thrown
+   * for an oversized file: the caller gets `tooLarge` plus the size that was
+   * actually seen, so each tool can word its own error.
+   *
+   * The size comes from `fstat` on that handle, not from an earlier `stat`, and
+   * the bytes are read in 64 KB pieces, so the allocation is bounded by the
+   * limit rather than by whatever the file reports. That matters in a container
+   * mounted from a NAS: Synology indexing, a desktop Obsidian saving the same
+   * note, or a cloud placeholder finishing its download all change files behind
+   * our back.
    */
-  private async readTextCapped(abs: string, sizeBytes: number, sizeMB: string): Promise<string> {
-    if (sizeBytes > this.limits.maxTextReadBytes)
+  private async readCapped(abs: string, capBytes: number): Promise<{ buffer?: Buffer; size: number; tooLarge: boolean }> {
+    let handle: fs.promises.FileHandle | null = null;
+    try {
+      handle = await fs.promises.open(abs, "r");
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new VaultError(`Not a regular file: ${abs}`);
+      if (stat.size > capBytes) return { size: stat.size, tooLarge: true };
+
+      const chunks: Buffer[] = [];
+      let total = 0;
+      while (total <= capBytes) {
+        const want = Math.min(64 * 1024, capBytes + 1 - total);
+        if (want <= 0) break;
+        const slice = Buffer.alloc(want);
+        const { bytesRead } = await handle.read(slice, 0, want, total);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+        chunks.push(slice.subarray(0, bytesRead));
+      }
+      if (total > capBytes) return { size: total, tooLarge: true };
+      return { buffer: Buffer.concat(chunks, total), size: total, tooLarge: false };
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  /** Text for `read_file`, with the cap enforced by the reader itself. */
+  private async readTextCapped(abs: string): Promise<string> {
+    const read = await this.readCapped(abs, this.limits.maxTextReadBytes);
+    if (!read.buffer)
       throw new VaultError(
-        `Text file too large to read (${sizeMB}, limit ${formatMegabytes(this.limits.maxTextReadBytes)}). ` +
+        `Text file too large to read (${formatMegabytes(read.size)}, ` +
+        `limit ${formatMegabytes(this.limits.maxTextReadBytes)}). ` +
         "Use run_local_command with grep/awk, or raise VAULT_API_MAX_TEXT_BYTES."
       );
-    const content = await fs.promises.readFile(abs, "utf-8");
-    const decoded = Buffer.byteLength(content);
-    if (decoded > this.limits.maxTextReadBytes)
-      throw new VaultError(
-        `Text file decodes above the limit (${formatMegabytes(decoded)}, ` +
-        `limit ${formatMegabytes(this.limits.maxTextReadBytes)}). Use run_local_command with grep/awk.`
-      );
-    return content;
+    return read.buffer.toString("utf-8");
   }
 
   async readFile(path: string): Promise<
@@ -241,7 +270,7 @@ export class VaultTools {
     const sizeMB = formatMegabytes(st.size);
     const cls = classifyExtension(path);
 
-    if (cls === "svg") return { type: "text", content: await this.readTextCapped(abs, st.size, sizeMB) };
+    if (cls === "svg") return { type: "text", content: await this.readTextCapped(abs) };
 
     if (cls === "image") {
       if (st.size > RESIZE_THRESHOLD) {
@@ -258,21 +287,27 @@ export class VaultTools {
           throw new VaultError(`Could not process image (${sizeMB}): ` + (err instanceof Error ? err.message : String(err)));
         }
       }
-      const buf = await fs.promises.readFile(abs);
-      return { type: "image", mimeType: mimeType(ext), data: buf.toString("base64") };
+      const image = await this.readCapped(abs, RESIZE_THRESHOLD);
+      if (!image.buffer)
+        throw new VaultError(
+          `Image grew beyond the inline limit (${formatMegabytes(image.size)}, ` +
+          `limit ${formatMegabytes(RESIZE_THRESHOLD)}). Use /raw with a signed URL.`
+        );
+      return { type: "image", mimeType: mimeType(ext), data: image.buffer.toString("base64") };
     }
 
     const textLike = cls === "text" || (cls === "unknown" && await this.readSniff(abs));
 
-    if (textLike) return { type: "text", content: await this.readTextCapped(abs, st.size, sizeMB) };
+    if (textLike) return { type: "text", content: await this.readTextCapped(abs) };
 
-    if (st.size > this.limits.maxBinaryReadBytes)
+    const binary = await this.readCapped(abs, this.limits.maxBinaryReadBytes);
+    if (!binary.buffer)
       throw new VaultError(
-        `File too large to return as base64 (${sizeMB}, limit ${formatMegabytes(this.limits.maxBinaryReadBytes)}). ` +
+        `File too large to return as base64 (${formatMegabytes(binary.size)}, ` +
+        `limit ${formatMegabytes(this.limits.maxBinaryReadBytes)}). ` +
         "Use /raw with a signed URL or run_local_command."
       );
-    const buf = await fs.promises.readFile(abs);
-    return { type: "binary", mimeType: mimeType(ext), data: buf.toString("base64"), size: st.size };
+    return { type: "binary", mimeType: mimeType(ext), data: binary.buffer.toString("base64"), size: binary.size };
   }
 
   // ── Writers ────────────────────────────────────────────────────────────
@@ -287,15 +322,22 @@ export class VaultTools {
   }
 
   async writeBinary(path: string, base64Data: string) {
-    const approxBytes = Math.ceil(base64Data.length * 3 / 4);
-    if (approxBytes > this.limits.maxBinaryReadBytes)
+    // Validated before anything is decoded. `Buffer.from(x, "base64")` silently
+    // drops characters outside the alphabet, so an unvalidated body can decode
+    // far above the size estimate, or be garbage that is written to the vault.
+    const payload = validateBase64Payload(base64Data, this.limits.maxBinaryReadBytes);
+    if (!payload.ok)
       throw new VaultError(
-        `Data too large to write (~${formatMegabytes(approxBytes)}, limit ${formatMegabytes(this.limits.maxBinaryReadBytes)}). ` +
-        "Raise VAULT_API_MAX_BINARY_BYTES if this is intentional."
+        `Data cannot be written: ${payload.reason}. Raise VAULT_API_MAX_BINARY_BYTES if this is intentional.`
       );
+
     const abs = await this.resolveSafe(path);
     await fs.promises.mkdir(nodePath.dirname(abs), { recursive: true });
     const buf = Buffer.from(base64Data, "base64");
+    if (buf.length !== payload.estimatedBytes)
+      throw new VaultError(
+        `Data cannot be written: decoded to ${buf.length} bytes, expected ${payload.estimatedBytes}`
+      );
     const existed = await this.statOrNull(abs);
     await fs.promises.writeFile(abs, buf);
     return { path, action: existed ? "updated" : "created", size: buf.length };

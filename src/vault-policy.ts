@@ -110,6 +110,39 @@ export function isIgnoredPath(vaultRelativePath: string): boolean {
   return false;
 }
 
+// ── base64 payload validation ──────────────────────────────────────────────
+//
+// Shared rule: identical to validateBase64Payload in the Obsidian plugin
+// project, so a client sees the same contract in both products.
+
+export type Base64Check = { ok: true; estimatedBytes: number } | { ok: false; reason: string };
+
+/**
+ * Validates a base64 payload **before** it is decoded. `Buffer.from(x, "base64")`
+ * silently discards characters outside the alphabet, so an unvalidated payload
+ * can decode to far more than the size estimate, or be written as garbage.
+ */
+export function validateBase64Payload(payload: unknown, maxDecodedBytes: number): Base64Check {
+  if (typeof payload !== "string" || payload.length === 0)
+    return { ok: false, reason: "'base64Data' must be a non-empty string" };
+  if (/\s/.test(payload))
+    return { ok: false, reason: "'base64Data' must not contain whitespace or line breaks" };
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(payload))
+    return { ok: false, reason: "'base64Data' contains characters outside the base64 alphabet" };
+  if (payload.length % 4 !== 0)
+    return { ok: false, reason: "'base64Data' length must be a multiple of 4" };
+
+  const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+  const estimatedBytes = (payload.length / 4) * 3 - padding;
+  if (estimatedBytes > maxDecodedBytes)
+    return {
+      ok: false,
+      reason: `data is too large (${formatMegabytes(estimatedBytes)} decoded, limit ${formatMegabytes(maxDecodedBytes)})`,
+    };
+
+  return { ok: true, estimatedBytes };
+}
+
 export function extensionOf(filePath: string): string {
   return nodePath.extname(filePath).replace(/^\./, "").toLowerCase();
 }
@@ -158,6 +191,9 @@ export function looksLikeText(sample: Buffer): boolean {
 }
 
 export function formatMegabytes(bytes: number): string {
+  // Sub-megabyte limits are configured in kilobytes, and "limit 0.1 MB" is a
+  // poor way to say 64 KB.
+  if (bytes > 0 && bytes < 0.95 * 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 

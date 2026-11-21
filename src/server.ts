@@ -5,12 +5,12 @@ import * as http from "node:http";
 import type { Socket } from "node:net";
 import * as nodePath from "node:path";
 import * as fs from "node:fs";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { VaultTools } from "./vault-tools.js";
 import { getDashboardHtml } from "./web-ui.js";
 import { publicConfig, type Config } from "./config.js";
-import { signRawToken, verifyRawToken } from "./vault-policy.js";
-import { isCommandAllowed } from "./command-policy.js";
+import { envBytes, signRawToken, validateBase64Payload, verifyRawToken } from "./vault-policy.js";
+import { checkCommand, childEnvironment, tokenizeCommand } from "./command-policy.js";
 import { APP_VERSION } from "./version.js";
 import type { UpdateResult, UpdateStatus } from "./updater.js";
 
@@ -18,7 +18,9 @@ const SSE_KEEPALIVE_MS = 15_000;
 
 const MAX_PATH_LEN = 1000;
 const MAX_CONTENT_LEN = 50 * 1024 * 1024;
-const MAX_B64_LEN = 700 * 1024 * 1024;
+// Derived from the limit the file layer enforces, so the HTTP layer never
+// accepts a body large enough to matter before the real check runs.
+const MAX_B64_LEN = Math.ceil(envBytes("VAULT_API_MAX_BINARY_BYTES", 32 * 1024 * 1024) * 4 / 3) + 4;
 const MAX_CMD_LEN = 2000;
 const MAX_QUERY_LEN = 500;
 const MAX_CMD_BUFFER = 10 * 1024 * 1024;
@@ -245,10 +247,10 @@ export class VaultMcpServer {
         },
         {
           name: "run_local_command",
-          description: "Run a shell/terminal command directly inside the vault directory inside the Docker container. Use this to run local scripts (Node.js/Python) that process vault files directly, or do anything requiring direct local file system access.",
+          description: "Run one program directly inside the vault directory, in this container. No shell is involved: the command is split into a program and its arguments, so command chaining, pipes, redirection and substitution do not work; quote one argument when it contains a space. The container's filesystem and network are the boundary here, and the allowlist restricts which program may run, not what it can do.",
           inputSchema: {
             type: "object",
-            properties: { command: { type: "string", description: "The terminal command to execute (e.g. 'node my_script.js')" } },
+            properties: { command: { type: "string", description: "Program and arguments, for example 'pdftotext -layout notes/a.pdf'. Use \"quotes\" or 'quotes' for a single argument containing a space; ; | & $ ` < > are literal characters, not shell syntax." } },
             required: ["command"],
           },
         },
@@ -351,6 +353,11 @@ export class VaultMcpServer {
           case "write_binary": {
             const p = validatePath(a.path);
             const base64Data = validateStr(a.base64Data, "base64Data", MAX_B64_LEN);
+            // Cheap early rejection with the same rules the file layer applies,
+            // using the limit currently in force rather than a constant.
+            const payload = validateBase64Payload(base64Data, this.tools.scanLimits.maxBinaryReadBytes);
+            if (!payload.ok)
+              return { content: [{ type: "text", text: `Invalid input: ${payload.reason}` }], isError: true };
             const r = await this.tools.writeBinary(p, base64Data);
             return { content: [{ type: "text", text: `Binary file ${r.action}: ${r.path} (${r.size} bytes)` }] };
           }
@@ -407,22 +414,49 @@ export class VaultMcpServer {
           case "run_local_command": {
             const cmd = validateStr(a.command, "command", MAX_CMD_LEN);
 
-            const blockReason = isCommandAllowed(cmd, this.allowedCommands);
+            let program: string;
+            let args: string[];
+            try {
+              const parsed = tokenizeCommand(cmd);
+              program = parsed.program;
+              args = parsed.args;
+            } catch (err) {
+              return {
+                content: [{ type: "text", text: `Invalid command: ${err instanceof Error ? err.message : String(err)}` }],
+                isError: true,
+              };
+            }
+
+            const blockReason = checkCommand(program, args, this.allowedCommands);
             if (blockReason) {
               return { content: [{ type: "text", text: `Blocked: ${blockReason}` }], isError: true };
             }
 
-            console.log(`[vault-api] run_local_command: ${cmd.slice(0, 200)}`);
+            console.log(`[vault-api] run_local_command: ${program} (${args.length} argument(s))`);
 
             return new Promise((resolve) => {
-              exec(cmd, { cwd: this.vaultBase, maxBuffer: MAX_CMD_BUFFER, timeout: COMMAND_TIMEOUT_MS }, (error, stdout, stderr) => {
+              // No shell is involved: execFile runs the program with argv, so no
+              // quoting can smuggle a second command, and the child gets a
+              // minimal environment because this process holds VAULT_API_KEY.
+              execFile(program, args, {
+                cwd: this.vaultBase,
+                maxBuffer: MAX_CMD_BUFFER,
+                timeout: COMMAND_TIMEOUT_MS,
+                killSignal: "SIGKILL",
+                env: childEnvironment(),
+                shell: false,
+              }, (error, stdout, stderr) => {
                 let text = "";
                 if (stdout) text += `--- STDOUT ---\n${stdout}\n`;
                 if (stderr) text += `--- STDERR ---\n${stderr}\n`;
                 if (error) text += `--- ERROR ---\n${error.message}\n`;
 
                 if (!text) text = "Command executed successfully with no output.";
-                resolve({ content: [{ type: "text", text }] });
+                // A non-zero exit, a signal, a timeout or a missing program is a
+                // failed call: the output is still returned, but the result is
+                // flagged so a client does not have to parse the text to learn
+                // that the command did not succeed.
+                resolve({ content: [{ type: "text", text }], isError: error !== null });
               });
             });
           }
