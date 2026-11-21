@@ -5,10 +5,12 @@ import * as http from "node:http";
 import type { Socket } from "node:net";
 import * as nodePath from "node:path";
 import * as fs from "node:fs";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { VaultTools } from "./vault-tools.js";
 import { getDashboardHtml } from "./web-ui.js";
-import type { Config } from "./config.js";
+import { publicConfig, type Config } from "./config.js";
+import { envBytes, signRawToken, validateBase64Payload, verifyRawToken } from "./vault-policy.js";
+import { checkCommand, childEnvironment, tokenizeCommand } from "./command-policy.js";
 import { APP_VERSION } from "./version.js";
 import type { UpdateResult, UpdateStatus } from "./updater.js";
 
@@ -16,38 +18,22 @@ const SSE_KEEPALIVE_MS = 15_000;
 
 const MAX_PATH_LEN = 1000;
 const MAX_CONTENT_LEN = 50 * 1024 * 1024;
-const MAX_B64_LEN = 700 * 1024 * 1024;
+// Derived from the limit the file layer enforces, so the HTTP layer never
+// accepts a body large enough to matter before the real check runs.
+const MAX_B64_LEN = Math.ceil(envBytes("VAULT_API_MAX_BINARY_BYTES", 32 * 1024 * 1024) * 4 / 3) + 4;
 const MAX_CMD_LEN = 2000;
 const MAX_QUERY_LEN = 500;
 const MAX_CMD_BUFFER = 10 * 1024 * 1024;
-
-function globMatch(pattern: string, cmd: string): boolean {
-  if (pattern === "*") return true;
-  const regexStr = "^" + pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, ".*")
-    .replace(/\?/g, ".")
-    + "$";
-  return new RegExp(regexStr, "i").test(cmd.trim());
-}
-
-function isCommandAllowed(cmd: string, patterns: string): string | null {
-  if (!patterns || patterns === "*") return null;
-  const cmds = cmd.trim().split(/\s+/);
-  const firstToken = cmds[0] || "";
-  for (const pattern of patterns.split(",")) {
-    const p = pattern.trim();
-    if (!p) continue;
-    if (globMatch(p, cmd.trim()) || globMatch(p, firstToken)) return null;
-  }
-  return `Command '${firstToken}' is not in the allowed list. Allowed patterns: ${patterns}`;
-}
+const TOOL_TIMEOUT_MS = 25_000;
+const COMMAND_TIMEOUT_MS = 25_000;
 
 function validatePath(p: unknown): string {
   if (typeof p !== "string" || p.length === 0)
     throw new Error("'path' must be a non-empty string");
   if (p.length > MAX_PATH_LEN)
     throw new Error(`'path' is too long (max ${MAX_PATH_LEN} chars)`);
+  if (p.includes("\0"))
+    throw new Error("'path' must not contain NUL bytes");
   if (nodePath.isAbsolute(p))
     throw new Error("'path' must be vault-relative (no leading slash or drive letter)");
   const segments = p.split(/[/\\]/);
@@ -261,10 +247,10 @@ export class VaultMcpServer {
         },
         {
           name: "run_local_command",
-          description: "Run a shell/terminal command directly inside the vault directory inside the Docker container. Use this to run local scripts (Node.js/Python) that process vault files directly, or do anything requiring direct local file system access.",
+          description: "Run one program directly inside the vault directory, in this container. No shell is involved: the command is split into a program and its arguments, so command chaining, pipes, redirection and substitution do not work; quote one argument when it contains a space. The container's filesystem and network are the boundary here, and the allowlist restricts which program may run, not what it can do.",
           inputSchema: {
             type: "object",
-            properties: { command: { type: "string", description: "The terminal command to execute (e.g. 'node my_script.js')" } },
+            properties: { command: { type: "string", description: "Program and arguments, for example 'pdftotext -layout notes/a.pdf'. Use \"quotes\" or 'quotes' for a single argument containing a space; ; | & $ ` < > are literal characters, not shell syntax." } },
             required: ["command"],
           },
         },
@@ -299,7 +285,7 @@ export class VaultMcpServer {
       console.log(`[vault-api] tool: ${name}`);
 
       try {
-        return await withTimeout(25_000, (async () => { switch (name) {
+        return await withTimeout(TOOL_TIMEOUT_MS, (async () => { switch (name) {
           case "list_files": {
             const folder = typeof a.folder === "string" ? a.folder : undefined;
             const extension = typeof a.extension === "string" ? a.extension : undefined;
@@ -318,7 +304,9 @@ export class VaultMcpServer {
 
               const filename = p.split("/").pop() ?? p;
               const host = process.env.VAULT_API_HOST ?? `127.0.0.1:${this.port}`;
-              const fileUrl = `http://${host}/raw?path=${encodeURIComponent(p)}&key=${this.apiKey}`;
+              // Short-lived signed URL: the API key must never travel inside a
+              // URL that ends up in the model context or in client logs.
+              const fileUrl = `http://${host}/raw?path=${encodeURIComponent(p)}&token=${signRawToken(this.apiKey, p)}`;
 
               const meta: string[] = [
                 `path: ${p}`,
@@ -365,6 +353,11 @@ export class VaultMcpServer {
           case "write_binary": {
             const p = validatePath(a.path);
             const base64Data = validateStr(a.base64Data, "base64Data", MAX_B64_LEN);
+            // Cheap early rejection with the same rules the file layer applies,
+            // using the limit currently in force rather than a constant.
+            const payload = validateBase64Payload(base64Data, this.tools.scanLimits.maxBinaryReadBytes);
+            if (!payload.ok)
+              return { content: [{ type: "text", text: `Invalid input: ${payload.reason}` }], isError: true };
             const r = await this.tools.writeBinary(p, base64Data);
             return { content: [{ type: "text", text: `Binary file ${r.action}: ${r.path} (${r.size} bytes)` }] };
           }
@@ -393,7 +386,8 @@ export class VaultMcpServer {
           case "delete_folder": {
             const p = validatePath(a.path);
             const result = await this.tools.deleteFolder(p);
-            return { content: [{ type: "text", text: `Folder ${result.action}: ${result.path}` }] };
+            const where = result.trashPath ? ` -> ${result.trashPath}` : "";
+            return { content: [{ type: "text", text: `${result.action === "moved_to_trash" ? "Folder moved to trash" : "Folder deleted"}: ${p}${where}` }] };
           }
 
           case "rename_folder": {
@@ -412,36 +406,66 @@ export class VaultMcpServer {
 
           case "delete_file": {
             const p = validatePath(a.path);
-            await this.tools.deleteFile(p);
-            return { content: [{ type: "text", text: `Deleted: ${p}` }] };
+            const r = await this.tools.deleteFile(p);
+            const where = r.trashPath ? ` -> ${r.trashPath}` : "";
+            return { content: [{ type: "text", text: `${r.action === "moved_to_trash" ? "Moved to trash" : "Deleted"}: ${p}${where}` }] };
           }
 
           case "run_local_command": {
             const cmd = validateStr(a.command, "command", MAX_CMD_LEN);
 
-            const blockReason = isCommandAllowed(cmd, this.allowedCommands);
+            let program: string;
+            let args: string[];
+            try {
+              const parsed = tokenizeCommand(cmd);
+              program = parsed.program;
+              args = parsed.args;
+            } catch (err) {
+              return {
+                content: [{ type: "text", text: `Invalid command: ${err instanceof Error ? err.message : String(err)}` }],
+                isError: true,
+              };
+            }
+
+            const blockReason = checkCommand(program, args, this.allowedCommands);
             if (blockReason) {
               return { content: [{ type: "text", text: `Blocked: ${blockReason}` }], isError: true };
             }
 
-            console.log(`[vault-api] run_local_command: ${cmd.slice(0, 200)}`);
+            console.log(`[vault-api] run_local_command: ${program} (${args.length} argument(s))`);
 
             return new Promise((resolve) => {
-              exec(cmd, { cwd: this.vaultBase, maxBuffer: MAX_CMD_BUFFER, timeout: 25_000 }, (error, stdout, stderr) => {
+              // No shell is involved: execFile runs the program with argv, so no
+              // quoting can smuggle a second command, and the child gets a
+              // minimal environment because this process holds VAULT_API_KEY.
+              execFile(program, args, {
+                cwd: this.vaultBase,
+                maxBuffer: MAX_CMD_BUFFER,
+                timeout: COMMAND_TIMEOUT_MS,
+                killSignal: "SIGKILL",
+                env: childEnvironment(),
+                shell: false,
+              }, (error, stdout, stderr) => {
                 let text = "";
                 if (stdout) text += `--- STDOUT ---\n${stdout}\n`;
                 if (stderr) text += `--- STDERR ---\n${stderr}\n`;
                 if (error) text += `--- ERROR ---\n${error.message}\n`;
 
                 if (!text) text = "Command executed successfully with no output.";
-                resolve({ content: [{ type: "text", text }] });
+                // A non-zero exit, a signal, a timeout or a missing program is a
+                // failed call: the output is still returned, but the result is
+                // flagged so a client does not have to parse the text to learn
+                // that the command did not succeed.
+                resolve({ content: [{ type: "text", text }], isError: error !== null });
               });
             });
           }
 
           case "search": {
             const query = validateStr(a.query, "query", MAX_QUERY_LEN);
-            const results = await this.tools.search(query);
+            // Stop scanning just before the tool timeout so the caller gets a
+            // partial result set instead of a timeout error.
+            const results = await this.tools.search(query, { deadlineAt: Date.now() + TOOL_TIMEOUT_MS - 4_000 });
             return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
           }
 
@@ -478,6 +502,12 @@ export class VaultMcpServer {
   }
 
   get running(): boolean { return this.isRunning; }
+
+  /** Applies a saved config change without rebuilding the HTTP listener. */
+  setConfig(config: Config): void {
+    this.config = config;
+    this.tools = new VaultTools(this.vaultBase);
+  }
 
   // ── HTTP server (web UI + MCP SSE) ────────────────────────────────────
 
@@ -531,6 +561,17 @@ export class VaultMcpServer {
     return url.searchParams.get("key") === this.apiKey;
   }
 
+  /**
+   * Management routes (config, key rotation, restart, update) used to be open
+   * to anyone who could reach the port, and /api/config returned the key.
+   * They now require the same credential as the MCP endpoints unless the
+   * operator explicitly sets managementAuth=false on a trusted network.
+   */
+  private managementAuthorized(req: http.IncomingMessage): boolean {
+    if (!this.config.managementAuth) return true;
+    return this.authed(req);
+  }
+
   // ── Request handler ──────────────────────────────────────────────────
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -542,15 +583,26 @@ export class VaultMcpServer {
 
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-    // ── Web UI dashboard (no auth — it's the config page) ──────────────
+    // ── Web UI dashboard ─────────────────────────────────────────────────
+    // The shell carries no secret: the key is entered by the operator and the
+    // management API is authenticated.
     if (url.pathname === "/" || url.pathname === "/ui" || url.pathname === "/dashboard") {
-      const cfg = this.callbacks.getConfig();
+      const pub = publicConfig(this.callbacks.getConfig());
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(getDashboardHtml(cfg.port, cfg.apiKey, APP_VERSION));
+      res.end(getDashboardHtml(pub.port, pub.apiKeyHint, APP_VERSION, pub.managementAuth));
       return;
     }
 
-    // ── Web API endpoints (no auth — local config only) ─────────────────
+    // ── Management API ───────────────────────────────────────────────────
+    if (url.pathname.startsWith("/api/")) {
+      if (!this.managementAuthorized(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized — management routes need X-Api-Key or ?key=..." }));
+        return;
+      }
+    }
+
+    // ── Web API endpoints ────────────────────────────────────────────────
     if (url.pathname === "/api/status" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -583,9 +635,8 @@ export class VaultMcpServer {
     }
 
     if (url.pathname === "/api/config" && req.method === "GET") {
-      const cfg = this.callbacks.getConfig();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(cfg));
+      res.end(JSON.stringify(publicConfig(this.callbacks.getConfig())));
       return;
     }
 
@@ -602,11 +653,13 @@ export class VaultMcpServer {
           if (partial.bindAddress !== undefined && typeof partial.bindAddress !== "string") throw new Error("Invalid bindAddress");
           if (partial.allowedCommands !== undefined && typeof partial.allowedCommands !== "string") throw new Error("Invalid allowedCommands");
           if (partial.autoUpdate !== undefined && typeof partial.autoUpdate !== "boolean") throw new Error("Invalid autoUpdate");
+          if (partial.managementAuth !== undefined && typeof partial.managementAuth !== "boolean") throw new Error("Invalid managementAuth");
+          if (partial.apiKey !== undefined) throw new Error("Use /api/key/regenerate to change the API key");
 
           const updated = this.callbacks.updateConfig(partial);
           this.config = updated;
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, config: updated }));
+          res.end(JSON.stringify({ ok: true, config: publicConfig(updated) }));
         } catch (err) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
@@ -661,7 +714,19 @@ export class VaultMcpServer {
       return;
     }
 
-    if (!this.authed(req)) {
+    // /raw also accepts a short-lived signed token so image URLs handed to a
+    // model never embed the API key.
+    const rawPath = url.searchParams.get("path") ?? "";
+    const rawTokenOk = url.pathname === "/raw" && verifyRawToken(this.apiKey, rawPath, url.searchParams.get("token"));
+
+    // A /message request belongs to an SSE session that already passed auth
+    // when it was opened. Clients such as LM Studio, Open WebUI and Claude
+    // Desktop authenticate only on the GET /sse URL, so requiring the key on
+    // every POST breaks them on the first tool call.
+    const sessionId = url.searchParams.get("sessionId") ?? "";
+    const knownSession = url.pathname === "/message" && this.transports.has(sessionId);
+
+    if (!rawTokenOk && !knownSession && !this.authed(req)) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized — send X-Api-Key header or ?key=..." }));
       return;
@@ -676,18 +741,25 @@ export class VaultMcpServer {
       }
 
       try {
-        const abs = nodePath.resolve(this.vaultBase, filePath);
-        if (!abs.startsWith(this.vaultBase)) { res.writeHead(400); res.end("Path traversal detected"); return; }
-        if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) { res.writeHead(404); res.end("File not found"); return; }
+        const abs = await this.tools.resolveSafe(filePath);
+        const stat = await fs.promises.stat(abs).catch(() => null);
+        if (!stat || !stat.isFile()) { res.writeHead(404); res.end("File not found"); return; }
 
-        const buf = fs.readFileSync(abs);
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
-          "Content-Length": buf.byteLength,
+          "Content-Length": String(stat.size),
         });
-        res.end(buf);
+        // Streamed on purpose: buffering a media file here would defeat the
+        // memory limits the container runs under.
+        const stream = fs.createReadStream(abs);
+        stream.on("error", err => {
+          console.error("[vault-api] /raw stream error:", err instanceof Error ? err.message : err);
+          res.destroy();
+        });
+        res.on("close", () => stream.destroy());
+        stream.pipe(res);
       } catch (err) {
-        console.error("[vault-api] /raw error:", err);
+        console.error("[vault-api] /raw error:", err instanceof Error ? err.message : err);
         res.writeHead(500); res.end("Error reading file");
       }
       return;

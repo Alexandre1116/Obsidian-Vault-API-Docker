@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
+import * as os from "node:os";
+import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 
 const GITHUB_OWNER = "Alexandre1116";
@@ -112,6 +114,32 @@ async function downloadFile(url: string, target: string): Promise<void> {
   }
 }
 
+/**
+ * Free memory inside the container cgroup. Building an update (npm ci + tsc +
+ * sharp) needs a few hundred MB; on a 1 GiB vault box this decides whether the
+ * update is safe to attempt at all.
+ */
+function cgroupHeadroomBytes(): number | null {
+  try {
+    const maxRaw = fs.readFileSync("/sys/fs/cgroup/memory.max", "utf-8").trim();
+    const current = Number(fs.readFileSync("/sys/fs/cgroup/memory.current", "utf-8").trim());
+    if (!Number.isFinite(current)) return null;
+    const max = maxRaw === "max" ? os.totalmem() : Number(maxRaw);
+    if (!Number.isFinite(max)) return null;
+    return max - current;
+  } catch {
+    return null;
+  }
+}
+
+const MIN_BUILD_HEADROOM_BYTES = 256 * 1024 * 1024;
+
+function sha256File(path: string): string {
+  const hash = crypto.createHash("sha256");
+  hash.update(fs.readFileSync(path));
+  return hash.digest("hex");
+}
+
 export class UpdateManager {
   private status: UpdateStatus;
   private interval: NodeJS.Timeout | null = null;
@@ -194,30 +222,87 @@ export class UpdateManager {
 
       this.status = { ...this.status, updating: true, lastError: null };
 
+      const headroom = cgroupHeadroomBytes();
+      if (headroom !== null && headroom < MIN_BUILD_HEADROOM_BYTES) {
+        throw new Error(
+          `Not enough memory to build an update (${Math.round(headroom / 1048576)} MB free, ` +
+          `needs ${MIN_BUILD_HEADROOM_BYTES / 1048576} MB). Raise the container/CT memory or update manually.`
+        );
+      }
+
       const latest = await getLatestVersion();
       tempDir = fs.mkdtempSync(nodePath.join(this.dataDir, ".update-"));
       const archivePath = nodePath.join(tempDir, "source.tar.gz");
       const sourceDir = nodePath.join(tempDir, "source");
       fs.mkdirSync(sourceDir);
       await downloadFile(`https://codeload.github.com/${GITHUB_OWNER}/${GITHUB_REPOSITORY}/tar.gz/refs/tags/${encodeURIComponent(latest.tag)}`, archivePath);
+      console.log(`[vault-api] Update archive sha256: ${sha256File(archivePath)}`);
       await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", sourceDir], tempDir);
 
       if (!fs.existsSync(nodePath.join(sourceDir, "package.json"))) throw new Error("Downloaded update is missing package.json");
-      await runCommand("npm", ["install", "--include=dev", "--no-audit", "--no-fund"], sourceDir);
+      const stagedManifest = JSON.parse(fs.readFileSync(nodePath.join(sourceDir, "package.json"), "utf-8")) as { version?: string };
+      if (stagedManifest.version !== latest.version) {
+        throw new Error(`Downloaded source reports v${stagedManifest.version}, expected v${latest.version}`);
+      }
+      if (!fs.existsSync(nodePath.join(sourceDir, "package-lock.json")))
+        throw new Error("Downloaded update is missing package-lock.json; refusing to install floating dependencies");
+
+      await runCommand("npm", ["ci", "--no-audit", "--no-fund"], sourceDir);
       await runCommand("npm", ["run", "build"], sourceDir);
 
       const appRoot = nodePath.resolve(__dirname, "..");
       const stagedDist = nodePath.join(sourceDir, "dist");
       if (!fs.existsSync(stagedDist)) throw new Error("Update build did not produce a dist directory");
-      await runCommand("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], sourceDir);
-      fs.cpSync(stagedDist, nodePath.join(appRoot, "dist"), { recursive: true, force: true });
-      const stagedNodeModules = nodePath.join(sourceDir, "node_modules");
-      if (fs.existsSync(stagedNodeModules)) {
-        fs.cpSync(stagedNodeModules, nodePath.join(appRoot, "node_modules"), { recursive: true, force: true });
+      if (!fs.existsSync(nodePath.join(stagedDist, "index.js"))) throw new Error("Update build did not produce dist/index.js");
+      await runCommand("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], sourceDir);
+
+      const liveDist = nodePath.join(appRoot, "dist");
+      const liveModules = nodePath.join(appRoot, "node_modules");
+      const liveManifest = nodePath.join(appRoot, "package.json");
+      const liveLockfile = nodePath.join(appRoot, "package-lock.json");
+      const prevDist = `${liveDist}.prev`;
+      const prevModules = `${liveModules}.prev`;
+      const prevManifest = `${liveManifest}.prev`;
+      const prevLockfile = `${liveLockfile}.prev`;
+
+      const backup = (from: string, to: string) => { if (fs.existsSync(from)) fs.copyFileSync(from, to); };
+      const swapDir = (live: string, prev: string, staged: string) => {
+        if (fs.existsSync(prev)) fs.rmSync(prev, { recursive: true, force: true });
+        if (fs.existsSync(live)) fs.renameSync(live, prev);
+        if (fs.existsSync(staged)) fs.cpSync(staged, live, { recursive: true });
+      };
+      const restore = (prev: string, live: string) => {
+        if (!fs.existsSync(prev)) return;
+        if (fs.existsSync(live)) fs.rmSync(live, { recursive: true, force: true });
+        fs.renameSync(prev, live);
+      };
+      const dropBackup = (prev: string) => { if (fs.existsSync(prev)) fs.rmSync(prev, { recursive: true, force: true }); };
+
+      backup(liveManifest, prevManifest);
+      backup(liveLockfile, prevLockfile);
+      swapDir(liveDist, prevDist, stagedDist);
+      swapDir(liveModules, prevModules, nodePath.join(sourceDir, "node_modules"));
+      fs.copyFileSync(nodePath.join(sourceDir, "package.json"), liveManifest);
+      fs.copyFileSync(nodePath.join(sourceDir, "package-lock.json"), liveLockfile);
+
+      // Smoke check before committing to the new build; roll everything back on
+      // failure so a bad update can never leave the server down.
+      try {
+        if (!fs.existsSync(nodePath.join(liveDist, "index.js"))) throw new Error("dist/index.js missing after swap");
+        if (!fs.existsSync(nodePath.join(liveModules, "sharp"))) throw new Error("sharp dependency missing after swap");
+        if (!fs.existsSync(nodePath.join(liveModules, "@modelcontextprotocol"))) throw new Error("MCP SDK missing after swap");
+      } catch (err) {
+        restore(prevDist, liveDist);
+        restore(prevModules, liveModules);
+        if (fs.existsSync(prevManifest)) fs.copyFileSync(prevManifest, liveManifest);
+        if (fs.existsSync(prevLockfile)) fs.copyFileSync(prevLockfile, liveLockfile);
+        dropBackup(prevDist); dropBackup(prevModules);
+        throw err;
       }
-      fs.copyFileSync(nodePath.join(sourceDir, "package.json"), nodePath.join(appRoot, "package.json"));
-      const stagedLockfile = nodePath.join(sourceDir, "package-lock.json");
-      if (fs.existsSync(stagedLockfile)) fs.copyFileSync(stagedLockfile, nodePath.join(appRoot, "package-lock.json"));
+      dropBackup(prevDist); dropBackup(prevModules);
+      if (fs.existsSync(prevManifest)) fs.rmSync(prevManifest);
+      if (fs.existsSync(prevLockfile)) fs.rmSync(prevLockfile);
+
       this.status = {
         ...this.status,
         currentVersion: latest.version,

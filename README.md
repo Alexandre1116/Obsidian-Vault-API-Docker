@@ -34,13 +34,17 @@ services:
       - /path/to/your/vault:/vault
       - vault-api-data:/data
     environment:
-      - VAULT_API_KEY=your-secret-key-here
+      - VAULT_API_ALLOWED_COMMANDS=ls *,stat *,grep *,wc *,head *,tail *,pdftotext *
+    env_file:
+      - .env
+    mem_limit: 512m
 
 volumes:
   vault-api-data:
 ```
 
 ```bash
+cp .env.example .env   # set VAULT_API_KEY, then: chmod 600 .env
 docker compose up -d
 ```
 
@@ -73,7 +77,18 @@ The dashboard lets you:
 - **Restart / Stop** the MCP server without stopping the container
 - **Copy connection info** — SSE URL, Claude Desktop JSON config, API key
 
-The web UI itself does not require authentication (it's the config page). The MCP endpoints (`/sse`, `/message`, `/raw`) require the API key.
+The dashboard page itself contains no secret: the server never sends the API key to the browser. Paste the key once per browser session (it is kept in `sessionStorage`) and the dashboard will use it as `X-Api-Key` for the management API. MCP endpoints (`/sse`, `/message`, `/raw`) and all `/api/*` management routes require the API key. Set `VAULT_API_MANAGEMENT_AUTH=false` only if something in front of the container already handles access control.
+
+## Security notes
+
+- The API key grants file access and shell access. Treat it like a password: keep it in `.env` (`chmod 600 .env`), never in the compose file, and rotate it from the dashboard if it leaks.
+- The key is not printed in logs, not returned by `GET /api/config`, and `/data/config.json` is saved with mode `0600` (on Windows the file inherits its NTFS ACL instead).
+- Image results give a short-lived signed `/raw` URL (`token=`, 15 minutes) instead of embedding the key, so the credential never enters the model context.
+- `run_local_command` **does not use a shell**: the command is tokenized and started with `execFile`, so `;`, `&&`, `||`, `|`, `&`, backticks, `$`, `<` and `>` are ordinary characters inside an argument and cannot start a second program. Quoting (`'…'`, `"…"`, `\`) is defined by the server so a path containing a space still works, and an unterminated quote is an error.
+- `VAULT_API_ALLOWED_COMMANDS` defaults to `*`, which means **no restriction**: any program, with any arguments — including `bash -c "…"`, which is how a client gets a shell anyway. As soon as you list programs the list becomes meaningful: each pattern matches the **whole command** (`ls *` allows `ls` with arguments, a bare `ls` allows only `ls` with none), arguments must stay inside the vault directory (no absolute paths, `~`, drive paths or `..`), flags that execute or delete by themselves (`-exec`, `-execdir`, `-ok`, `-delete`, `-fprint`, `-fls`) are rejected, and the child process gets a minimal environment instead of the container's, so `VAULT_API_KEY` is never handed to it.
+- **The allowlist is not a sandbox, and treating it as one is a mistake.** An allowlisted program keeps everything its own manual describes: `grep -f FILE` reads a pattern file, `python -c` runs code, `pandoc --lua-filter` runs a filter, `git -c core.fsmonitor=…` runs a command. The real boundary is the container: the vault mount, the network and the read-only rootfs. List the smallest set of programs you need, prefer exact commands, and never list anything that can execute code if clients you do not trust can reach the port.
+- Bind to a trusted interface (`VAULT_API_BIND`), or restrict the port with your firewall. The container drops all capabilities, is read-only and cannot escalate privileges in the shipped compose file.
+- `delete_file` and `delete_folder` move content to `.trash/` inside the vault. Set `VAULT_API_TRASH_DIR=` (empty) for permanent deletion.
 
 ## Configuration
 
@@ -86,11 +101,22 @@ Configuration is stored in `/data/config.json` and persists across container res
 | `VAULT_API_PORT` | `2768` | Port to listen on |
 | `VAULT_API_BIND` | `0.0.0.0` | Bind address (`0.0.0.0` for Docker / network access) |
 | `VAULT_API_KEY` | *(auto-generated)* | API key for MCP authentication. If empty, one is generated and saved |
-| `VAULT_API_ALLOWED_COMMANDS` | `*` | Glob patterns for allowed shell commands (comma-separated). `*` = all |
+| `VAULT_API_ALLOWED_COMMANDS` | `*` | Comma-separated patterns matched against the whole command (`ls *`, `pdftotext -layout notes/*.pdf`). `*` = no restriction |
 | `VAULT_API_AUTO_UPDATE` | `false` | Enable daily GitHub update checks on first boot. The Web UI setting is saved in `/data/config.json` |
+| `VAULT_API_MANAGEMENT_AUTH` | `true` | Require the API key for the dashboard's management API (`/api/*`) |
 | `VAULT_API_HOST` | `127.0.0.1:2768` | Host reported in image URLs (set to your external address if behind a proxy) |
+| `VAULT_API_TRASH_DIR` | `.trash` | Vault-relative trash for deletions. Empty = permanent delete |
+| `VAULT_API_MAX_SCAN_FILE_BYTES` | `2097152` | Largest file `search` will open |
+| `VAULT_API_MAX_TEXT_BYTES` | `4194304` | Largest file `read_file` returns as text |
+| `VAULT_API_MAX_BINARY_BYTES` | `33554432` | Largest file returned as base64, and largest `write_binary` payload |
+| `VAULT_API_MAX_WALK_ENTRIES` | `20000` | Entries one `list_files`/`search` call may visit |
+| `VAULT_API_MAX_SCAN_TOTAL_BYTES` | `33554432` | Total bytes one `search` call may read |
 
-Automatic updates use the latest stable GitHub release, or the newest semantic-version tag when no release is available. The server downloads the source, builds it inside the container, replaces the compiled application, and exits so Docker can restart it. Keep `restart: unless-stopped` enabled for automatic restarts.
+These limits exist because vaults are often shared with course media and backups. A single 5 GB `.iso` read as UTF-8 text is enough to have the kernel OOM-kill the process on a small host; the defaults keep one tool call inside a few tens of MB. When a budget stops a scan, the result says `partial: true` and explains why.
+
+Environment variables are **initial defaults only**: once `/data/config.json` exists it wins, so a rotated API key is not overwritten by the compose file on the next restart.
+
+Automatic updates use the latest stable GitHub release, or the newest semantic-version tag when no release is available. The server downloads the source, builds it inside the container, replaces the compiled application, and exits so Docker can restart it. Keep `restart: unless-stopped` enabled for automatic restarts. The updater verifies the downloaded version matches the tag, refuses to build when the container has too little free memory, and rolls `dist/`, `node_modules/` and the manifest back if the new build does not load. In-container updates need `read_only: false`.
 
 ## Connecting Your AI Client
 
@@ -140,7 +166,7 @@ Either:
 | `delete_folder` | Delete a folder |
 | `rename_folder` | Rename or move a folder |
 | `search` | Keyword search across filenames and content |
-| `run_local_command` | Run a shell command inside the container, in the vault directory |
+| `run_local_command` | Run one allowlisted program inside the container, in the vault directory (no shell) |
 
 ## Image Support
 
@@ -202,7 +228,7 @@ VAULT_PATH=/path/to/vault VAULT_API_KEY=secret npm start
 | **Runtime** | Inside Obsidian desktop app | Standalone Node.js in Docker |
 | **File access** | Obsidian Vault API (`app.vault`) | Node.js `fs` |
 | **Image resize** | Electron Canvas API | `sharp` (native, no GUI dependency) |
-| **File deletion** | System trash (recoverable) | Permanent delete |
+| **File deletion** | System trash (recoverable) | `.trash/` inside the vault (recoverable; configurable) |
 | **Settings UI** | Obsidian settings tab | Web UI at `http://host:2768/` |
 | **Config storage** | Obsidian plugin data | `/data/config.json` (Docker volume) |
 | **Bind address** | `127.0.0.1` only | Configurable (`0.0.0.0` by default) |
