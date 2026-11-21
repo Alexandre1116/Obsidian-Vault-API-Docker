@@ -18,10 +18,11 @@ services:
       - DATA_DIR=/data
       - VAULT_API_PORT=2768
       - VAULT_API_BIND=0.0.0.0
-      # Read-only helpers, all confined to the vault directory. A bare name
-      # allows any arguments, so anything that can execute or delete by itself
-      # (git, find -exec, pandoc filters) is deliberately not listed.
-      - VAULT_API_ALLOWED_COMMANDS=ls,stat,grep,wc,head,tail,pdftotext
+      # Read-only helpers, each pinned to its invocation shape. A bare name means
+      # that command with no arguments, so the `*` suffix is what allows a path.
+      # Anything that can execute or write by itself (git, find, pandoc, python)
+      # is deliberately not listed.
+      - VAULT_API_ALLOWED_COMMANDS=ls *,stat *,grep *,wc *,head *,tail *,pdftotext *
       - VAULT_API_MANAGEMENT_AUTH=true
     # Blast radius: on a small host the default is unlimited memory, so one bad
     # read can get the whole container group OOM-killed.
